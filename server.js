@@ -19,7 +19,7 @@ const DEFAULT_DAYS_BACK = Number(process.env.DEFAULT_DAYS_BACK || 7);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/* ---------- Helpers ---------- */
+/* ---------- helpers ---------- */
 function normalizeError(e, route, req) {
   const status = e?.response?.status || 500;
   const data = e?.response?.data;
@@ -67,13 +67,14 @@ function dateRange(daysBack = DEFAULT_DAYS_BACK) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-/* ---------- Static and Widget ---------- */
+/* ---------- static + widget ---------- */
 app.use("/public", express.static(path.join(__dirname, "public")));
 app.get("/widget", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "widget.html"));
 });
 
-/* ---------- Diagnostics ---------- */
+/* ---------- diagnostics ---------- */
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
 app.get("/diag/config", (req, res) => {
   res.json({
     WXCC_API_BASE,
@@ -81,7 +82,6 @@ app.get("/diag/config", (req, res) => {
     WXCC_SCOPE: process.env.WXCC_SCOPE || "(unset)"
   });
 });
-
 app.get("/diag/routes", (req, res) => {
   const routes = [];
   app._router.stack.forEach((m) => {
@@ -100,169 +100,121 @@ app.get("/diag/routes", (req, res) => {
   res.json({ routes });
 });
 
-/* ---------- Interactions via Search API (GraphQL) ---------- */
-/*
-  We query /v1/search with a GraphQL body.
-  Adjust field names if your tenant differs. The Search API is the supported
-  way to read historical interactions programmatically.
-*/
-async function searchInteractions({ token, agentEmail, fromISO, toISO, limit }) {
-  const url = `${WXCC_API_BASE}/v1/search`;
-  const headers = {
-    Authorization: "Bearer " + token,
-    "Content-Type": "application/json",
-    Accept: "application/json"
-  };
-
-  const query = `
-    query ($from: DateTime!, $to: DateTime!, $agent: String!, $limit: Int!) {
-      interactions(
-        from: $from
-        to: $to
-        filter: { agentEmail: { equals: $agent }, interactionType: { equals: VOICE } }
-        limit: $limit
-        sort: { field: START_TIME, order: DESC }
-      ) {
-        items {
-          interactionId
-          startTime
-          endTime
-          ani
-          dnis
-          queueName
-          disposition
-          taskId
-        }
-      }
-    }
-  `;
-
-  const variables = {
-    from: fromISO,
-    to: toISO,
-    agent: agentEmail,
-    limit: Math.min(1000, Number(limit) || 200)
-  };
-
-  const resp = await axios.post(url, { query, variables }, { headers });
-  const items =
-    resp.data?.data?.interactions?.items ||
-    resp.data?.interactions?.items || // some tenants return a flattened payload
-    [];
-  return items;
-}
-
-app.get("/api/interactions", async (req, res) => {
-  try {
-    const token = await getAccessToken(req);
-    const agentEmail = (req.query.agentEmail || "").toString().trim();
-    const daysBack = Number(req.query.daysBack || DEFAULT_DAYS_BACK);
-    if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
-    const { start, end } = dateRange(daysBack);
-
-    const items = await searchInteractions({
-      token,
-      agentEmail,
-      fromISO: start,
-      toISO: end,
-      limit: 200
-    });
-
-    res.json({ items });
-  } catch (e) {
-    const { status, body } = normalizeError(e, "/api/interactions", req);
-    res.status(status).json(body);
-  }
+/* ---------- interactions endpoint disabled here on purpose ---------- */
+app.get("/api/interactions", (_req, res) => {
+  res.status(501).json({
+    error: "Historical interactions API is not enabled on this tenant. Use /api/captures/recent instead."
+  });
 });
 
-/* ---------- Captures. seed with interactionIds then /v1/captures/query ---------- */
+/* ---------- captures via v1/captures/query ---------- */
+/*
+   We mirror your working curl:
+   POST https://api.<region>.cisco.com/v1/captures/query
+   Body: { "query": { "taskIds": [] } }
+
+   Then we filter by createdAt within the requested hours window.
+   If the capture payload exposes an agent email, we filter by that as well.
+*/
 app.get("/api/captures/recent", async (req, res) => {
   try {
     const token = await getAccessToken(req);
-    const agentEmail = (req.query.agentEmail || "").toString().trim();
+    const agentEmail = (req.query.agentEmail || "").toString().trim().toLowerCase();
     const hours = Math.max(1, Number(req.query.hours || 24));
-    const limit = Math.min(1000, Number(req.query.limit || 200));
-    if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
-
     const now = new Date();
     const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
-    const headers = { Authorization: "Bearer " + token };
 
-    const interactions = await searchInteractions({
-      token,
-      agentEmail,
-      fromISO: from.toISOString(),
-      toISO: now.toISOString(),
-      limit
-    });
+    const headers = {
+      Authorization: "Bearer " + token,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    };
 
-    if (!interactions.length) {
-      return res.json({ items: [], window: { start: from.toISOString(), end: now.toISOString() } });
-    }
+    const url = `${WXCC_API_BASE}/v1/captures/query`;
 
-    const ixById = new Map(interactions.map((it) => [String(it.interactionId), it]));
-    const interactionIds = [...ixById.keys()];
+    // Minimal query body that matches your working curl.
+    const body = { query: { taskIds: [] } };
 
-    const MAX_IDS_PER_CAPTURE_QUERY = 10;
-    const allCaptures = [];
+    const r = await axios.post(url, body, { headers });
 
-    async function postCapturesQuery(ids) {
-      const url = `${WXCC_API_BASE}/v1/captures/query`;
-      const payload = { query: { interactionIds: ids } };
-      const r = await axios.post(url, payload, {
-        headers: { ...headers, Accept: "application/json", "Content-Type": "application/json" }
-      });
-      return Array.isArray(r.data?.items) ? r.data.items : [];
-    }
+    // Normalize array of captures from various response shapes.
+    const captures = Array.isArray(r.data?.items)
+      ? r.data.items
+      : Array.isArray(r.data)
+      ? r.data
+      : [];
 
-    for (let i = 0; i < interactionIds.length; i += MAX_IDS_PER_CAPTURE_QUERY) {
-      const batch = interactionIds.slice(i, i + MAX_IDS_PER_CAPTURE_QUERY);
-      const items = await postCapturesQuery(batch);
-      allCaptures.push(...items);
-      if (allCaptures.length >= limit) break;
-    }
+    // Some orgs return different shapes. We will pick likely fields.
+    const pickCreated = (c) => c.createdAt || c.startTime || c.timestamp || c.recordedAt || null;
+    const pickUrl =
+      (c) =>
+        c.url ||
+        c.playbackUrl ||
+        c.downloadUrl ||
+        (c.mediaFiles && c.mediaFiles[0] && c.mediaFiles[0].url) ||
+        (c.links && (c.links.playback || c.links.download)) ||
+        null;
 
-    const pickUrl = (rec) =>
-      rec?.url ||
-      rec?.playbackUrl ||
-      rec?.downloadUrl ||
-      (rec.mediaFiles?.[0]?.url) ||
-      rec?.links?.playback ||
-      rec?.links?.download ||
-      null;
+    // Try to identify agent email in common places.
+    const pickAgentEmails = (c) => {
+      const emails = new Set();
+      if (typeof c.agentEmail === "string") emails.add(c.agentEmail.toLowerCase());
+      if (c.agent && typeof c.agent.email === "string") emails.add(c.agent.email.toLowerCase());
+      if (Array.isArray(c.participants)) {
+        c.participants.forEach((p) => {
+          if (typeof p?.email === "string") emails.add(p.email.toLowerCase());
+          if (typeof p?.agentEmail === "string") emails.add(p.agentEmail.toLowerCase());
+        });
+      }
+      return [...emails];
+    };
 
-    const normalized = allCaptures
+    const withinWindow = (c) => {
+      const ts = pickCreated(c);
+      if (!ts) return false;
+      const t = new Date(ts);
+      return t >= from && t <= now;
+    };
+
+    const agentMatches = (c) => {
+      if (!agentEmail) return true;
+      const emails = pickAgentEmails(c);
+      if (!emails.length) return true; // do not drop if agent is not present in payload
+      return emails.includes(agentEmail);
+    };
+
+    const normalized = captures
+      .filter(withinWindow)
+      .filter(agentMatches)
       .map((c) => {
-        const ix = ixById.get(String(c.interactionId)) || {};
-        const durationSec =
-          ix.startTime && ix.endTime
-            ? Math.max(0, Math.round((new Date(ix.endTime) - new Date(ix.startTime)) / 1000))
-            : null;
         return {
           captureId: c.captureId || c.id || null,
-          interactionId: c.interactionId || null,
-          taskId: c.taskId || ix.taskId || null,
-          createdAt: c.createdAt || ix.startTime || null,
+          interactionId: c.interactionId || c.taskId || null,
+          taskId: c.taskId || null,
+          createdAt: pickCreated(c),
           url: pickUrl(c),
-          ani: ix.ani || null,
-          queueName: ix.queueName || null,
-          disposition: ix.disposition || null,
-          durationSec
+          // pass through a few helpful fields if present
+          ani: c.ani || c.callerId || null,
+          dnis: c.dnis || null,
+          queueName: c.queueName || null,
+          disposition: c.disposition || null
         };
       })
       .filter((x) => !!x.url);
 
+    // Sort newest first.
     normalized.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    const items = normalized.slice(0, limit);
 
-    res.json({ items, window: { start: from.toISOString(), end: now.toISOString() } });
+    res.json({
+      items: normalized,
+      window: { start: from.toISOString(), end: now.toISOString() },
+      note: "Results filtered client side because /v1/search is not enabled on this tenant."
+    });
   } catch (e) {
     const { status, body } = normalizeError(e, "/api/captures/recent", req);
     res.status(status).json(body);
   }
 });
-
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
   console.log("My Interactions server listening on port " + PORT);
