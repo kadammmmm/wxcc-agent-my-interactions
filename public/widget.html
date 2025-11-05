@@ -5,92 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>My Interactions</title>
     <style>
-      body {
-        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
-          Helvetica, Arial;
-        margin: 0;
-        padding: 16px;
-      }
-      header {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 12px;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-      }
-      th,
-      td {
-        padding: 8px;
-        border-bottom: 1px solid #e5e7eb;
-        text-align: left;
-      }
-      th {
-        background: #f9fafb;
-        position: sticky;
-        top: 0;
-      }
-      .controls {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        margin-bottom: 12px;
-      }
-      .badge {
-        background: #eef2ff;
-        color: #3730a3;
-        border-radius: 999px;
-        padding: 2px 8px;
-        font-size: 12px;
-      }
-      .muted {
-        color: #6b7280;
-        font-size: 12px;
-      }
-      .btn {
-        padding: 6px 10px;
-        border: 1px solid #d1d5db;
-        border-radius: 8px;
-        background: #fff;
-        cursor: pointer;
-      }
-      audio {
-        width: 240px;
-      }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 0; padding: 16px; }
+      header { display:flex; align-items:center; gap:8px; margin-bottom:12px; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 8px; border-bottom: 1px solid #e5e7eb; text-align:left; }
+      th { background: #f9fafb; position: sticky; top: 0; }
+      .controls { display:flex; gap:8px; align-items:center; margin-bottom: 12px; flex-wrap: wrap; }
+      .badge { background:#eef2ff; color:#3730a3; border-radius: 999px; padding: 2px 8px; font-size: 12px; }
+      .muted { color:#6b7280; font-size:12px; }
+      .btn { padding:6px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; }
+      audio { width: 240px; }
+      input { padding:6px; border:1px solid #d1d5db; border-radius:6px }
     </style>
   </head>
   <body>
     <header>
-      <h2 style="margin: 0">My Interactions</h2>
+      <h2 style="margin:0">My Interactions</h2>
       <span class="badge" id="range"></span>
     </header>
 
     <div class="controls">
-      <label>
-        Agent Email
-        <input
-          id="agentEmail"
-          style="padding: 6px; border: 1px solid #d1d5db; border-radius: 6px"
-          placeholder="agent@example.com"
-        />
-      </label>
-      <label>
-        Days Back
-        <input
-          id="daysBack"
-          type="number"
-          min="1"
-          max="60"
-          value="7"
-          style="width: 70px; padding: 6px; border: 1px solid #d1d5db; border-radius: 6px"
-        />
-      </label>
+      <label>Agent Email <input id="agentEmail" placeholder="agent@example.com"/></label>
+      <label>Hours Back <input id="hoursBack" type="number" min="1" max="72" value="24" style="width:80px"/></label>
       <button class="btn" id="reload">Reload</button>
-      <span class="muted">
-        (If embedded in Agent Desktop, pass Authorization and agentEmail via query or headers)
-      </span>
+      <span class="muted">Parent can send agent email via postMessage</span>
     </div>
 
     <table id="grid">
@@ -98,7 +36,6 @@
         <tr>
           <th>Date/Time</th>
           <th>ANI</th>
-          <th>DNIS</th>
           <th>Queue</th>
           <th>Disposition</th>
           <th>Duration</th>
@@ -111,121 +48,94 @@
     <script>
       const $ = (s) => document.querySelector(s);
 
-      async function getJsonOrThrow(resp) {
-        const body = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          const errText =
-            typeof body.error === "string"
-              ? body.error
-              : JSON.stringify(body.error || body);
-          throw new Error(errText || "Request failed");
-        }
-        return body;
-      }
-
       const params = new URLSearchParams(location.search);
       if (params.get("agentEmail")) {
         $("#agentEmail").value = params.get("agentEmail");
       }
-      if (params.get("daysBack")) {
-        $("#daysBack").value = params.get("daysBack");
+
+      function requestParentContext() {
+        try {
+          if (window.parent && window.parent !== window) {
+            window.parent.postMessage({ type: "REQUEST_WXCC_CONTEXT" }, "*");
+          }
+        } catch (_) {}
+      }
+
+      window.addEventListener("message", (ev) => {
+        const d = ev?.data || {};
+        if (d && d.type === "WXCC_CONTEXT" && d.agentEmail) {
+          $("#agentEmail").value = d.agentEmail;
+        }
+      });
+
+      async function getJsonOrThrow(resp) {
+        const ct = resp.headers.get("content-type") || "";
+        let body = null;
+        if (ct.includes("application/json")) {
+          body = await resp.json().catch(() => ({}));
+        } else {
+          const txt = await resp.text().catch(() => "");
+          try { body = JSON.parse(txt); } catch { body = { error: txt || "no body" }; }
+        }
+        if (!resp.ok) {
+          const msg = body?.error || body?.message || body?.error_description || JSON.stringify(body || {});
+          throw new Error(resp.status + " " + resp.statusText + ". " + msg);
+        }
+        return body;
       }
 
       async function load() {
         const agentEmail = $("#agentEmail").value.trim();
-        const daysBack = Number($("#daysBack").value || 7);
-        $("#range").textContent = daysBack + " day window";
-        if (!agentEmail) {
-          alert("Enter Agent Email");
-          return;
-        }
-
-        let interactions;
-        try {
-          interactions = await fetch(
-            "/api/interactions?agentEmail=" +
-              encodeURIComponent(agentEmail) +
-              "&daysBack=" +
-              daysBack
-          ).then(getJsonOrThrow);
-        } catch (e) {
-          const tbody = document.querySelector("#grid tbody");
-          tbody.innerHTML =
-            '<tr><td colspan="7">Failed to load interactions: ' +
-            (e.message || "Unknown error") +
-            "</td></tr>";
-          return;
-        }
-
-        const tbody = document.querySelector("#grid tbody");
+        const hoursBack = Number($("#hoursBack").value || 24);
+        $("#range").textContent = hoursBack + "h window";
+        const tbody = $("#grid tbody");
         tbody.innerHTML = "";
 
-        if (!interactions.items || !Array.isArray(interactions.items)) {
-          const errText =
-            typeof interactions.error === "string"
-              ? interactions.error
-              : JSON.stringify(interactions.error || {});
+        if (!agentEmail) {
+          requestParentContext();
           const tr = document.createElement("tr");
-          tr.innerHTML =
-            '<td colspan="7">Failed to load interactions: ' +
-            (errText || "No items in response") +
-            "</td>";
+          tr.innerHTML = "<td colspan='6'>Waiting for agent email from parent, or enter it above.</td>";
           tbody.appendChild(tr);
           return;
         }
 
-        for (const it of interactions.items) {
-          const tr = document.createElement("tr");
-          const started = new Date(it.startTime).toLocaleString();
-          const durationSec = Math.round(
-            (new Date(it.endTime) - new Date(it.startTime)) / 1000
-          );
-          const mm = Math.floor(durationSec / 60)
-            .toString()
-            .padStart(2, "0");
-          const ss = (durationSec % 60).toString().padStart(2, "0");
-          tr.innerHTML =
-            "<td>" +
-            started +
-            "</td><td>" +
-            (it.ani || "") +
-            "</td><td>" +
-            (it.dnis || "") +
-            "</td><td>" +
-            (it.queueName || "") +
-            "</td><td>" +
-            (it.disposition || "") +
-            "</td><td>" +
-            mm +
-            ":" +
-            ss +
-            "</td><td data-rec></td>";
-          tbody.appendChild(tr);
+        try {
+          const data = await fetch(
+            "/api/captures/recent?agentEmail=" + encodeURIComponent(agentEmail) + "&hours=" + hoursBack
+          ).then(getJsonOrThrow);
 
-          try {
-            const rec = await fetch(
-              "/api/recordings?interactionId=" +
-                encodeURIComponent(it.interactionId) +
-                "&agentEmail=" +
-                encodeURIComponent(agentEmail)
-            ).then(getJsonOrThrow);
-            const cell = tr.querySelector("[data-rec]");
-            if (rec && rec.url) {
-              cell.innerHTML =
-                '<audio controls src="' + rec.url + '"></audio>';
-            } else if (rec && rec.urls && rec.urls.length) {
-              cell.innerHTML =
-                '<audio controls src="' + rec.urls[0] + '"></audio>';
-            } else {
-              cell.textContent = "—";
-            }
-          } catch (e) {
-            tr.querySelector("[data-rec]").textContent = "error";
+          const items = Array.isArray(data.items) ? data.items : [];
+          if (!items.length) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = "<td colspan='6'>No recordings found in the window.</td>";
+            tbody.appendChild(tr);
+            return;
           }
+
+          for (const c of items) {
+            const tr = document.createElement("tr");
+            const t = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
+            const dur = c.durationSec != null
+              ? Math.floor(c.durationSec/60) + ":" + String(c.durationSec % 60).padStart(2, "0")
+              : "";
+            tr.innerHTML =
+              "<td>" + t + "</td>" +
+              "<td>" + (c.ani || "") + "</td>" +
+              "<td>" + (c.queueName || "") + "</td>" +
+              "<td>" + (c.disposition || "") + "</td>" +
+              "<td>" + dur + "</td>" +
+              "<td>" + (c.url ? ('<audio controls src="' + c.url + '"></audio>') : "—") + "</td>";
+            tbody.appendChild(tr);
+          }
+        } catch (e) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = "<td colspan='6'>Failed to load: " + (e.message || "error") + "</td>";
+          tbody.appendChild(tr);
         }
       }
 
-      $("#reload").addEventListener("click", load);
+      document.getElementById("reload").addEventListener("click", load);
+      setTimeout(requestParentContext, 50);
       if ($("#agentEmail").value) load();
     </script>
   </body>
