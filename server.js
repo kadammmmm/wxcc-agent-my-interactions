@@ -100,37 +100,82 @@ app.get("/diag/routes", (req, res) => {
   res.json({ routes });
 });
 
-/* ---------- API: Interactions, historical search ---------- */
+/* ---------- Interactions via Search API (GraphQL) ---------- */
+/*
+  We query /v1/search with a GraphQL body.
+  Adjust field names if your tenant differs. The Search API is the supported
+  way to read historical interactions programmatically.
+*/
+async function searchInteractions({ token, agentEmail, fromISO, toISO, limit }) {
+  const url = `${WXCC_API_BASE}/v1/search`;
+  const headers = {
+    Authorization: "Bearer " + token,
+    "Content-Type": "application/json",
+    Accept: "application/json"
+  };
+
+  const query = `
+    query ($from: DateTime!, $to: DateTime!, $agent: String!, $limit: Int!) {
+      interactions(
+        from: $from
+        to: $to
+        filter: { agentEmail: { equals: $agent }, interactionType: { equals: VOICE } }
+        limit: $limit
+        sort: { field: START_TIME, order: DESC }
+      ) {
+        items {
+          interactionId
+          startTime
+          endTime
+          ani
+          dnis
+          queueName
+          disposition
+          taskId
+        }
+      }
+    }
+  `;
+
+  const variables = {
+    from: fromISO,
+    to: toISO,
+    agent: agentEmail,
+    limit: Math.min(1000, Number(limit) || 200)
+  };
+
+  const resp = await axios.post(url, { query, variables }, { headers });
+  const items =
+    resp.data?.data?.interactions?.items ||
+    resp.data?.interactions?.items || // some tenants return a flattened payload
+    [];
+  return items;
+}
+
 app.get("/api/interactions", async (req, res) => {
   try {
     const token = await getAccessToken(req);
     const agentEmail = (req.query.agentEmail || "").toString().trim();
     const daysBack = Number(req.query.daysBack || DEFAULT_DAYS_BACK);
     if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
-
     const { start, end } = dateRange(daysBack);
-    const headers = { Authorization: "Bearer " + token };
-    const url = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
-    const payload = {
-      filters: [
-        { field: "agentEmail", operator: "EQUALS", value: agentEmail },
-        { field: "interactionType", operator: "EQUALS", value: "VOICE" },
-        { field: "startTime", operator: "BETWEEN", value: [start, end] }
-      ],
-      limit: 50,
-      sort: [{ field: "startTime", order: "DESC" }],
-      fields: ["interactionId", "startTime", "endTime", "ani", "dnis", "queueName", "disposition"]
-    };
 
-    const r = await axios.post(url, payload, { headers });
-    res.json({ items: r.data?.items || r.data?.data || [] });
+    const items = await searchInteractions({
+      token,
+      agentEmail,
+      fromISO: start,
+      toISO: end,
+      limit: 200
+    });
+
+    res.json({ items });
   } catch (e) {
     const { status, body } = normalizeError(e, "/api/interactions", req);
     res.status(status).json(body);
   }
 });
 
-/* ---------- API: Captures recent. Interactions first, then v1/captures/query in 10-ID batches ---------- */
+/* ---------- Captures. seed with interactionIds then /v1/captures/query ---------- */
 app.get("/api/captures/recent", async (req, res) => {
   try {
     const token = await getAccessToken(req);
@@ -140,25 +185,19 @@ app.get("/api/captures/recent", async (req, res) => {
     if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
 
     const now = new Date();
-    const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
     const headers = { Authorization: "Bearer " + token };
 
-    const interactionsUrl = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
-    const interactionsPayload = {
-      filters: [
-        { field: "agentEmail", operator: "EQUALS", value: agentEmail },
-        { field: "interactionType", operator: "EQUALS", value: "VOICE" },
-        { field: "startTime", operator: "BETWEEN", value: [start.toISOString(), now.toISOString()] }
-      ],
-      limit,
-      sort: [{ field: "startTime", order: "DESC" }],
-      fields: ["interactionId", "taskId", "startTime", "endTime", "ani", "queueName", "disposition"]
-    };
+    const interactions = await searchInteractions({
+      token,
+      agentEmail,
+      fromISO: from.toISOString(),
+      toISO: now.toISOString(),
+      limit
+    });
 
-    const ir = await axios.post(interactionsUrl, interactionsPayload, { headers });
-    const interactions = ir.data?.items || ir.data?.data || [];
     if (!interactions.length) {
-      return res.json({ items: [], window: { start: start.toISOString(), end: now.toISOString() } });
+      return res.json({ items: [], window: { start: from.toISOString(), end: now.toISOString() } });
     }
 
     const ixById = new Map(interactions.map((it) => [String(it.interactionId), it]));
@@ -216,7 +255,7 @@ app.get("/api/captures/recent", async (req, res) => {
     normalized.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     const items = normalized.slice(0, limit);
 
-    res.json({ items, window: { start: start.toISOString(), end: now.toISOString() } });
+    res.json({ items, window: { start: from.toISOString(), end: now.toISOString() } });
   } catch (e) {
     const { status, body } = normalizeError(e, "/api/captures/recent", req);
     res.status(status).json(body);
