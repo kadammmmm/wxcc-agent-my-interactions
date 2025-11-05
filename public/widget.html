@@ -68,15 +68,16 @@
     </header>
 
     <div class="controls">
-      <label
-        >Agent Email
+      <label>
+        Agent Email
         <input
           id="agentEmail"
           style="padding: 6px; border: 1px solid #d1d5db; border-radius: 6px"
           placeholder="agent@example.com"
-      /></label>
-      <label
-        >Days Back
+        />
+      </label>
+      <label>
+        Days Back
         <input
           id="daysBack"
           type="number"
@@ -84,12 +85,12 @@
           max="60"
           value="7"
           style="width: 70px; padding: 6px; border: 1px solid #d1d5db; border-radius: 6px"
-      /></label>
+        />
+      </label>
       <button class="btn" id="reload">Reload</button>
-      <span class="muted"
-        >(If embedded in Agent Desktop, pass Authorization and agentEmail via
-        query or headers)</span
-      >
+      <span class="muted">
+        (If embedded in Agent Desktop, pass Authorization and agentEmail via query or headers)
+      </span>
     </div>
 
     <table id="grid">
@@ -109,37 +110,65 @@
 
     <script>
       const $ = (s) => document.querySelector(s);
+
+      async function getJsonOrThrow(resp) {
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          const errText =
+            typeof body.error === "string"
+              ? body.error
+              : JSON.stringify(body.error || body);
+          throw new Error(errText || "Request failed");
+        }
+        return body;
+      }
+
       const params = new URLSearchParams(location.search);
-      if (params.get("agentEmail"))
+      if (params.get("agentEmail")) {
         $("#agentEmail").value = params.get("agentEmail");
+      }
+      if (params.get("daysBack")) {
+        $("#daysBack").value = params.get("daysBack");
+      }
 
       async function load() {
         const agentEmail = $("#agentEmail").value.trim();
         const daysBack = Number($("#daysBack").value || 7);
         $("#range").textContent = daysBack + " day window";
-
         if (!agentEmail) {
           alert("Enter Agent Email");
           return;
         }
 
-        const interactions = await fetch(
-          "/api/interactions?agentEmail=" +
-            encodeURIComponent(agentEmail) +
-            "&daysBack=" +
-            daysBack
-        )
-          .then((r) => r.json())
-          .catch((e) => ({ items: [], error: String(e) }));
+        let interactions;
+        try {
+          interactions = await fetch(
+            "/api/interactions?agentEmail=" +
+              encodeURIComponent(agentEmail) +
+              "&daysBack=" +
+              daysBack
+          ).then(getJsonOrThrow);
+        } catch (e) {
+          const tbody = document.querySelector("#grid tbody");
+          tbody.innerHTML =
+            '<tr><td colspan="7">Failed to load interactions: ' +
+            (e.message || "Unknown error") +
+            "</td></tr>";
+          return;
+        }
 
         const tbody = document.querySelector("#grid tbody");
         tbody.innerHTML = "";
 
-        if (!interactions.items) {
+        if (!interactions.items || !Array.isArray(interactions.items)) {
+          const errText =
+            typeof interactions.error === "string"
+              ? interactions.error
+              : JSON.stringify(interactions.error || {});
           const tr = document.createElement("tr");
           tr.innerHTML =
             '<td colspan="7">Failed to load interactions: ' +
-            (interactions.error || "unknown error") +
+            (errText || "No items in response") +
             "</td>";
           tbody.appendChild(tr);
           return;
@@ -179,7 +208,7 @@
                 encodeURIComponent(it.interactionId) +
                 "&agentEmail=" +
                 encodeURIComponent(agentEmail)
-            ).then((r) => r.json());
+            ).then(getJsonOrThrow);
             const cell = tr.querySelector("[data-rec]");
             if (rec && rec.url) {
               cell.innerHTML =
@@ -191,7 +220,7 @@
               cell.textContent = "—";
             }
           } catch (e) {
-            tr.querySelector("[data-rec]").textContent = "—";
+            tr.querySelector("[data-rec]").textContent = "error";
           }
         }
       }
