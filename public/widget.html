@@ -84,6 +84,11 @@
         return body;
       }
 
+      async function loadCore(endpoint, agentEmail, hoursBack) {
+        const url = endpoint + "?hours=" + hoursBack + (agentEmail ? "&agentEmail=" + encodeURIComponent(agentEmail) : "");
+        return fetch(url).then(getJsonOrThrow);
+      }
+
       async function load() {
         const agentEmail = $("#agentEmail").value.trim();
         const hoursBack = Number($("#hoursBack").value || 24);
@@ -99,37 +104,38 @@
           return;
         }
 
+        let data = null;
         try {
-          const data = await fetch(
-            "/api/captures/recent?agentEmail=" + encodeURIComponent(agentEmail) + "&hours=" + hoursBack
-          ).then(getJsonOrThrow);
-
-          const items = Array.isArray(data.items) ? data.items : [];
-          if (!items.length) {
-            const tr = document.createElement("tr");
-            tr.innerHTML = "<td colspan='6'>No recordings found in the window.</td>";
-            tbody.appendChild(tr);
-            return;
-          }
-
-          for (const c of items) {
-            const tr = document.createElement("tr");
-            const t = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
-            const dur = c.durationSec != null
-              ? Math.floor(c.durationSec/60) + ":" + String(c.durationSec % 60).padStart(2, "0")
-              : "";
-            tr.innerHTML =
-              "<td>" + t + "</td>" +
-              "<td>" + (c.ani || "") + "</td>" +
-              "<td>" + (c.queueName || "") + "</td>" +
-              "<td>" + (c.disposition || "") + "</td>" +
-              "<td>" + dur + "</td>" +
-              "<td>" + (c.url ? ('<audio controls src="' + c.url + '"></audio>') : "—") + "</td>";
-            tbody.appendChild(tr);
-          }
+          data = await loadCore("/api/captures/recent", agentEmail, hoursBack);
         } catch (e) {
+          if (String(e.message || "").startsWith("404")) {
+            data = await loadCore("/api/captures/recent-captures", "", hoursBack);
+          } else {
+            throw e;
+          }
+        }
+
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (!items.length) {
           const tr = document.createElement("tr");
-          tr.innerHTML = "<td colspan='6'>Failed to load: " + (e.message || "error") + "</td>";
+          tr.innerHTML = "<td colspan='6'>No recordings found in the window.</td>";
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const c of items) {
+          const tr = document.createElement("tr");
+          const t = c.createdAt ? new Date(c.createdAt).toLocaleString() : "";
+          const dur = c.durationSec != null
+            ? Math.floor(c.durationSec/60) + ":" + String(c.durationSec % 60).padStart(2, "0")
+            : "";
+          tr.innerHTML =
+            "<td>" + t + "</td>" +
+            "<td>" + (c.ani || "") + "</td>" +
+            "<td>" + (c.queueName || "") + "</td>" +
+            "<td>" + (c.disposition || "") + "</td>" +
+            "<td>" + dur + "</td>" +
+            "<td>" + (c.url ? ('<audio controls src="' + c.url + '"></audio>') : "—") + "</td>";
           tbody.appendChild(tr);
         }
       }

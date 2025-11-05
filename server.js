@@ -19,6 +19,7 @@ const DEFAULT_DAYS_BACK = Number(process.env.DEFAULT_DAYS_BACK || 7);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/* ---------- Helpers ---------- */
 function normalizeError(e, route, req) {
   const status = e?.response?.status || 500;
   const data = e?.response?.data;
@@ -32,7 +33,13 @@ function normalizeError(e, route, req) {
     e?.message ||
     "Unknown server error";
   console.error("UPSTREAM ERROR", { route: req?.originalUrl || route, status, method, url, msg, data });
-  return { status, body: { error: msg || "(empty message from upstream)", upstream: { status, method, url, body: data ?? "(no body)" } } };
+  return {
+    status,
+    body: {
+      error: msg || "(empty message from upstream)",
+      upstream: { status, method, url, body: data ?? "(no body)" }
+    }
+  };
 }
 
 async function getAccessToken(req) {
@@ -60,18 +67,37 @@ function dateRange(daysBack = DEFAULT_DAYS_BACK) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
+/* ---------- Static and Widget ---------- */
 app.use("/public", express.static(path.join(__dirname, "public")));
-
 app.get("/widget", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "widget.html"));
 });
 
+/* ---------- Diagnostics ---------- */
 app.get("/diag/config", (req, res) => {
   res.json({
     WXCC_API_BASE,
     TOKEN_URL: TOKEN_URL ? "set" : "unset",
     WXCC_SCOPE: process.env.WXCC_SCOPE || "(unset)"
   });
+});
+
+app.get("/diag/routes", (req, res) => {
+  const routes = [];
+  app._router.stack.forEach((m) => {
+    if (m.route && m.route.path) {
+      const methods = Object.keys(m.route.methods).join(",").toUpperCase();
+      routes.push({ methods, path: m.route.path });
+    } else if (m.name === "router" && m.handle?.stack) {
+      m.handle.stack.forEach((h) => {
+        if (h.route) {
+          const methods = Object.keys(h.route.methods).join(",").toUpperCase();
+          routes.push({ methods, path: h.route.path });
+        }
+      });
+    }
+  });
+  res.json({ routes });
 });
 
 app.get("/diag/paths", async (req, res) => {
@@ -88,7 +114,6 @@ app.get("/diag/paths", async (req, res) => {
     };
     const tests = [];
     tests.push(await tryPost(`${WXCC_API_BASE}/v1/data/historical/interactions/search`, { limit: 1 }));
-    tests.push(await tryPost(`${WXCC_API_BASE}/v1/analytics/interactions/search`, { limit: 1 }));
     tests.push(await tryPost(`${WXCC_API_BASE}/v1/captures/query`, { query: { interactionIds: ["dummy"] } }));
     tests.push(await tryPost(`${WXCC_API_BASE}/v1/data/historical/captures/search`, { limit: 1 }));
     res.json({ WXCC_API_BASE, tests });
@@ -98,6 +123,38 @@ app.get("/diag/paths", async (req, res) => {
   }
 });
 
+/* ---------- API: Interactions (Analyzer, data/historical only) ---------- */
+app.get("/api/interactions", async (req, res) => {
+  try {
+    const token = await getAccessToken(req);
+    const agentEmail = (req.query.agentEmail || "").toString().trim();
+    const daysBack = Number(req.query.daysBack || DEFAULT_DAYS_BACK);
+    if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
+
+    const { start, end } = dateRange(daysBack);
+    const headers = { Authorization: "Bearer " + token };
+
+    const url = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
+    const payload = {
+      filters: [
+        { field: "agentEmail", operator: "EQUALS", value: agentEmail },
+        { field: "interactionType", operator: "EQUALS", value: "VOICE" },
+        { field: "startTime", operator: "BETWEEN", value: [start, end] }
+      ],
+      limit: 50,
+      sort: [{ field: "startTime", order: "DESC" }],
+      fields: ["interactionId", "startTime", "endTime", "ani", "dnis", "queueName", "disposition"]
+    };
+
+    const r = await axios.post(url, payload, { headers });
+    res.json({ items: r.data?.items || r.data?.data || [] });
+  } catch (e) {
+    const { status, body } = normalizeError(e, "/api/interactions", req);
+    res.status(status).json(body);
+  }
+});
+
+/* ---------- API: Captures recent, uses interactions then captures in batches of 10 ---------- */
 app.get("/api/captures/recent", async (req, res) => {
   try {
     const token = await getAccessToken(req);
@@ -110,6 +167,8 @@ app.get("/api/captures/recent", async (req, res) => {
     const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
     const headers = { Authorization: "Bearer " + token };
 
+    // Pull interactions from data/historical only
+    const interactionsUrl = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
     const interactionsPayload = {
       filters: [
         { field: "agentEmail", operator: "EQUALS", value: agentEmail },
@@ -121,23 +180,11 @@ app.get("/api/captures/recent", async (req, res) => {
       fields: ["interactionId", "taskId", "startTime", "endTime", "ani", "queueName", "disposition"]
     };
 
-    async function fetchInteractions() {
-      const primary = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
-      try {
-        const r = await axios.post(primary, interactionsPayload, { headers });
-        return r.data?.items || r.data?.data || [];
-      } catch (e) {
-        if (e.response?.status === 404) {
-          const alt = `${WXCC_API_BASE}/v1/analytics/interactions/search`;
-          const r2 = await axios.post(alt, interactionsPayload, { headers });
-          return r2.data?.items || r2.data?.data || [];
-        }
-        throw e;
-      }
+    const ir = await axios.post(interactionsUrl, interactionsPayload, { headers });
+    const interactions = ir.data?.items || ir.data?.data || [];
+    if (!interactions.length) {
+      return res.json({ items: [], window: { start: start.toISOString(), end: now.toISOString() } });
     }
-
-    const interactions = await fetchInteractions();
-    if (!interactions.length) return res.json({ items: [], window: { start: start.toISOString(), end: now.toISOString() } });
 
     const ixById = new Map(interactions.map((it) => [String(it.interactionId), it]));
     const interactionIds = [...ixById.keys()];
@@ -223,55 +270,50 @@ app.get("/api/captures/recent", async (req, res) => {
   }
 });
 
-app.get("/api/interactions", async (req, res) => {
+/* ---------- API: Captures recent by time window only (no interactions) ---------- */
+app.get("/api/captures/recent-captures", async (req, res) => {
   try {
     const token = await getAccessToken(req);
-    const agentEmail = (req.query.agentEmail || "").toString().trim();
-    const daysBack = Number(req.query.daysBack || DEFAULT_DAYS_BACK);
-    if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
+    const hours = Math.max(1, Number(req.query.hours || 24));
+    const limit = Math.min(1000, Number(req.query.limit || 200));
 
-    const { start, end } = dateRange(daysBack);
-    const payloadBase = {
-      limit: 50,
-      sort: [{ field: "startTime", order: "DESC" }],
-      fields: ["interactionId", "startTime", "endTime", "ani", "dnis", "queueName", "disposition"]
-    };
-    const filters = [
-      { field: "agentEmail", operator: "EQUALS", value: agentEmail },
-      { field: "interactionType", operator: "EQUALS", value: "VOICE" },
-      { field: "startTime", operator: "BETWEEN", value: [start, end] }
-    ];
+    const now = new Date();
+    const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
     const headers = { Authorization: "Bearer " + token };
+    const url = `${WXCC_API_BASE}/v1/data/historical/captures/search`;
+    const payload = {
+      filters: [
+        { field: "createdAt", operator: "BETWEEN", value: [start.toISOString(), now.toISOString()] }
+      ],
+      limit,
+      sort: [{ field: "createdAt", order: "DESC" }],
+      fields: ["id", "captureId", "interactionId", "taskId", "createdAt", "url", "playbackUrl", "downloadUrl", "mediaFiles", "links"]
+    };
 
-    async function postSearch(url, body) {
-      const r = await axios.post(url, body, { headers });
-      return r.data?.items || r.data?.data || [];
-    }
+    const r = await axios.post(url, payload, { headers });
 
-    let items;
-    try {
-      items = await postSearch(`${WXCC_API_BASE}/v1/data/historical/interactions/search`, { ...payloadBase, filters });
-    } catch (e) {
-      const status = e?.response?.status;
-      if (status === 404) {
-        items = await postSearch(`${WXCC_API_BASE}/v1/analytics/interactions/search`, { ...payloadBase, filters });
-      } else if (status === 400) {
-        items = await postSearch(`${WXCC_API_BASE}/v1/data/historical/interactions/search`, {
-          ...payloadBase,
-          filters: [
-            { field: "interactionType", operator: "EQUALS", value: "VOICE" },
-            { field: "startTime", operator: "BETWEEN", value: [start, end] }
-          ]
-        });
-        items = items.filter((x) => (x.agentEmail || "").toLowerCase() === agentEmail.toLowerCase());
-      } else {
-        throw e;
-      }
-    }
+    const pickUrl = (rec) =>
+      rec?.url ||
+      rec?.playbackUrl ||
+      rec?.downloadUrl ||
+      (rec.mediaFiles?.[0]?.url) ||
+      rec?.links?.playback ||
+      rec?.links?.download ||
+      null;
 
-    res.json({ items });
+    const items = (Array.isArray(r.data?.items) ? r.data.items : [])
+      .map((c) => ({
+        captureId: c.captureId || c.id || null,
+        interactionId: c.interactionId || null,
+        taskId: c.taskId || null,
+        createdAt: c.createdAt || null,
+        url: pickUrl(c)
+      }))
+      .filter((x) => !!x.url);
+
+    res.json({ items, window: { start: start.toISOString(), end: now.toISOString() } });
   } catch (e) {
-    const { status, body } = normalizeError(e, "/api/interactions", req);
+    const { status, body } = normalizeError(e, "/api/captures/recent-captures", req);
     res.status(status).json(body);
   }
 });
