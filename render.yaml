@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: wxcc-agent-my-interactions
+    env: node
+    plan: free
+    runtime: node
+    nodeVersion: 20
+    buildCommand: npm install
+    startCommand: npm run start
+    healthCheckPath: /healthz
+    autoDeploy: true
