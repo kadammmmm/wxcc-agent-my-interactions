@@ -84,11 +84,6 @@
         return body;
       }
 
-      async function loadCore(endpoint, agentEmail, hoursBack) {
-        const url = endpoint + "?hours=" + hoursBack + (agentEmail ? "&agentEmail=" + encodeURIComponent(agentEmail) : "");
-        return fetch(url).then(getJsonOrThrow);
-      }
-
       async function load() {
         const agentEmail = $("#agentEmail").value.trim();
         const hoursBack = Number($("#hoursBack").value || 24);
@@ -104,16 +99,16 @@
           return;
         }
 
-        let data = null;
-        try {
-          data = await loadCore("/api/captures/recent", agentEmail, hoursBack);
-        } catch (e) {
-          if (String(e.message || "").startsWith("404")) {
-            data = await loadCore("/api/captures/recent-captures", "", hoursBack);
-          } else {
-            throw e;
-          }
-        }
+        const data = await fetch(
+          "/api/captures/recent?agentEmail=" + encodeURIComponent(agentEmail) + "&hours=" + hoursBack
+        ).then(getJsonOrThrow).catch((e) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = "<td colspan='6'>Failed to load: " + (e.message || "error") + "</td>";
+          tbody.appendChild(tr);
+          return null;
+        });
+
+        if (!data) return;
 
         const items = Array.isArray(data.items) ? data.items : [];
         if (!items.length) {

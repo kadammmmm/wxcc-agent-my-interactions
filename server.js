@@ -100,30 +100,7 @@ app.get("/diag/routes", (req, res) => {
   res.json({ routes });
 });
 
-app.get("/diag/paths", async (req, res) => {
-  try {
-    const token = await getAccessToken(req);
-    const headers = { Authorization: "Bearer " + token };
-    const tryPost = async (url, body) => {
-      try {
-        const r = await axios.post(url, body, { headers, validateStatus: () => true });
-        return { url, status: r.status, ok: r.status < 400, sample: r.data };
-      } catch (e) {
-        return { url, status: e?.response?.status || 500, ok: false, sample: e?.response?.data || e.message };
-      }
-    };
-    const tests = [];
-    tests.push(await tryPost(`${WXCC_API_BASE}/v1/data/historical/interactions/search`, { limit: 1 }));
-    tests.push(await tryPost(`${WXCC_API_BASE}/v1/captures/query`, { query: { interactionIds: ["dummy"] } }));
-    tests.push(await tryPost(`${WXCC_API_BASE}/v1/data/historical/captures/search`, { limit: 1 }));
-    res.json({ WXCC_API_BASE, tests });
-  } catch (e) {
-    const { status, body } = normalizeError(e, "/diag/paths", req);
-    res.status(status).json(body);
-  }
-});
-
-/* ---------- API: Interactions (Analyzer, data/historical only) ---------- */
+/* ---------- API: Interactions, historical search ---------- */
 app.get("/api/interactions", async (req, res) => {
   try {
     const token = await getAccessToken(req);
@@ -133,7 +110,6 @@ app.get("/api/interactions", async (req, res) => {
 
     const { start, end } = dateRange(daysBack);
     const headers = { Authorization: "Bearer " + token };
-
     const url = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
     const payload = {
       filters: [
@@ -154,7 +130,7 @@ app.get("/api/interactions", async (req, res) => {
   }
 });
 
-/* ---------- API: Captures recent, uses interactions then captures in batches of 10 ---------- */
+/* ---------- API: Captures recent. Interactions first, then v1/captures/query in 10-ID batches ---------- */
 app.get("/api/captures/recent", async (req, res) => {
   try {
     const token = await getAccessToken(req);
@@ -167,7 +143,6 @@ app.get("/api/captures/recent", async (req, res) => {
     const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
     const headers = { Authorization: "Bearer " + token };
 
-    // Pull interactions from data/historical only
     const interactionsUrl = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
     const interactionsPayload = {
       filters: [
@@ -201,32 +176,10 @@ app.get("/api/captures/recent", async (req, res) => {
       return Array.isArray(r.data?.items) ? r.data.items : [];
     }
 
-    async function postCapturesSearch(ids) {
-      const url = `${WXCC_API_BASE}/v1/data/historical/captures/search`;
-      const filters = ids.map((id) => ({ field: "interactionId", operator: "EQUALS", value: id }));
-      const payload = {
-        filters,
-        limit: ids.length,
-        sort: [{ field: "createdAt", order: "DESC" }],
-        fields: ["id", "captureId", "interactionId", "taskId", "createdAt", "url", "playbackUrl", "downloadUrl", "mediaFiles", "links"]
-      };
-      const r = await axios.post(url, payload, { headers });
-      return Array.isArray(r.data?.items) ? r.data.items : [];
-    }
-
     for (let i = 0; i < interactionIds.length; i += MAX_IDS_PER_CAPTURE_QUERY) {
       const batch = interactionIds.slice(i, i + MAX_IDS_PER_CAPTURE_QUERY);
-      try {
-        const items = await postCapturesQuery(batch);
-        allCaptures.push(...items);
-      } catch (e) {
-        if (e.response?.status === 404) {
-          const items2 = await postCapturesSearch(batch);
-          allCaptures.push(...items2);
-        } else {
-          throw e;
-        }
-      }
+      const items = await postCapturesQuery(batch);
+      allCaptures.push(...items);
       if (allCaptures.length >= limit) break;
     }
 
@@ -266,54 +219,6 @@ app.get("/api/captures/recent", async (req, res) => {
     res.json({ items, window: { start: start.toISOString(), end: now.toISOString() } });
   } catch (e) {
     const { status, body } = normalizeError(e, "/api/captures/recent", req);
-    res.status(status).json(body);
-  }
-});
-
-/* ---------- API: Captures recent by time window only (no interactions) ---------- */
-app.get("/api/captures/recent-captures", async (req, res) => {
-  try {
-    const token = await getAccessToken(req);
-    const hours = Math.max(1, Number(req.query.hours || 24));
-    const limit = Math.min(1000, Number(req.query.limit || 200));
-
-    const now = new Date();
-    const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
-    const headers = { Authorization: "Bearer " + token };
-    const url = `${WXCC_API_BASE}/v1/data/historical/captures/search`;
-    const payload = {
-      filters: [
-        { field: "createdAt", operator: "BETWEEN", value: [start.toISOString(), now.toISOString()] }
-      ],
-      limit,
-      sort: [{ field: "createdAt", order: "DESC" }],
-      fields: ["id", "captureId", "interactionId", "taskId", "createdAt", "url", "playbackUrl", "downloadUrl", "mediaFiles", "links"]
-    };
-
-    const r = await axios.post(url, payload, { headers });
-
-    const pickUrl = (rec) =>
-      rec?.url ||
-      rec?.playbackUrl ||
-      rec?.downloadUrl ||
-      (rec.mediaFiles?.[0]?.url) ||
-      rec?.links?.playback ||
-      rec?.links?.download ||
-      null;
-
-    const items = (Array.isArray(r.data?.items) ? r.data.items : [])
-      .map((c) => ({
-        captureId: c.captureId || c.id || null,
-        interactionId: c.interactionId || null,
-        taskId: c.taskId || null,
-        createdAt: c.createdAt || null,
-        url: pickUrl(c)
-      }))
-      .filter((x) => !!x.url);
-
-    res.json({ items, window: { start: start.toISOString(), end: now.toISOString() } });
-  } catch (e) {
-    const { status, body } = normalizeError(e, "/api/captures/recent-captures", req);
     res.status(status).json(body);
   }
 });
