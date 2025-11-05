@@ -1,0 +1,203 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>My Interactions</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Helvetica, Arial;
+        margin: 0;
+        padding: 16px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        padding: 8px;
+        border-bottom: 1px solid #e5e7eb;
+        text-align: left;
+      }
+      th {
+        background: #f9fafb;
+        position: sticky;
+        top: 0;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      .badge {
+        background: #eef2ff;
+        color: #3730a3;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 12px;
+      }
+      .muted {
+        color: #6b7280;
+        font-size: 12px;
+      }
+      .btn {
+        padding: 6px 10px;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        background: #fff;
+        cursor: pointer;
+      }
+      audio {
+        width: 240px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h2 style="margin: 0">My Interactions</h2>
+      <span class="badge" id="range"></span>
+    </header>
+
+    <div class="controls">
+      <label
+        >Agent Email
+        <input
+          id="agentEmail"
+          style="padding: 6px; border: 1px solid #d1d5db; border-radius: 6px"
+          placeholder="agent@example.com"
+      /></label>
+      <label
+        >Days Back
+        <input
+          id="daysBack"
+          type="number"
+          min="1"
+          max="60"
+          value="7"
+          style="width: 70px; padding: 6px; border: 1px solid #d1d5db; border-radius: 6px"
+      /></label>
+      <button class="btn" id="reload">Reload</button>
+      <span class="muted"
+        >(If embedded in Agent Desktop, pass Authorization and agentEmail via
+        query or headers)</span
+      >
+    </div>
+
+    <table id="grid">
+      <thead>
+        <tr>
+          <th>Date/Time</th>
+          <th>ANI</th>
+          <th>DNIS</th>
+          <th>Queue</th>
+          <th>Disposition</th>
+          <th>Duration</th>
+          <th>Recording</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <script>
+      const $ = (s) => document.querySelector(s);
+      const params = new URLSearchParams(location.search);
+      if (params.get("agentEmail"))
+        $("#agentEmail").value = params.get("agentEmail");
+
+      async function load() {
+        const agentEmail = $("#agentEmail").value.trim();
+        const daysBack = Number($("#daysBack").value || 7);
+        $("#range").textContent = daysBack + " day window";
+
+        if (!agentEmail) {
+          alert("Enter Agent Email");
+          return;
+        }
+
+        const interactions = await fetch(
+          "/api/interactions?agentEmail=" +
+            encodeURIComponent(agentEmail) +
+            "&daysBack=" +
+            daysBack
+        )
+          .then((r) => r.json())
+          .catch((e) => ({ items: [], error: String(e) }));
+
+        const tbody = document.querySelector("#grid tbody");
+        tbody.innerHTML = "";
+
+        if (!interactions.items) {
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            '<td colspan="7">Failed to load interactions: ' +
+            (interactions.error || "unknown error") +
+            "</td>";
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const it of interactions.items) {
+          const tr = document.createElement("tr");
+          const started = new Date(it.startTime).toLocaleString();
+          const durationSec = Math.round(
+            (new Date(it.endTime) - new Date(it.startTime)) / 1000
+          );
+          const mm = Math.floor(durationSec / 60)
+            .toString()
+            .padStart(2, "0");
+          const ss = (durationSec % 60).toString().padStart(2, "0");
+          tr.innerHTML =
+            "<td>" +
+            started +
+            "</td><td>" +
+            (it.ani || "") +
+            "</td><td>" +
+            (it.dnis || "") +
+            "</td><td>" +
+            (it.queueName || "") +
+            "</td><td>" +
+            (it.disposition || "") +
+            "</td><td>" +
+            mm +
+            ":" +
+            ss +
+            "</td><td data-rec></td>";
+          tbody.appendChild(tr);
+
+          try {
+            const rec = await fetch(
+              "/api/recordings?interactionId=" +
+                encodeURIComponent(it.interactionId) +
+                "&agentEmail=" +
+                encodeURIComponent(agentEmail)
+            ).then((r) => r.json());
+            const cell = tr.querySelector("[data-rec]");
+            if (rec && rec.url) {
+              cell.innerHTML =
+                '<audio controls src="' + rec.url + '"></audio>';
+            } else if (rec && rec.urls && rec.urls.length) {
+              cell.innerHTML =
+                '<audio controls src="' + rec.urls[0] + '"></audio>';
+            } else {
+              cell.textContent = "—";
+            }
+          } catch (e) {
+            tr.querySelector("[data-rec]").textContent = "—";
+          }
+        }
+      }
+
+      $("#reload").addEventListener("click", load);
+      if ($("#agentEmail").value) load();
+    </script>
+  </body>
+</html>
