@@ -11,37 +11,57 @@ app.use(cors({ origin: true, credentials: false }));
 
 const PORT = process.env.PORT || 8080;
 const WXCC_API_BASE = process.env.WXCC_API_BASE || "https://api.wxcc-us1.cisco.com";
+const TOKEN_URL = process.env.WXCC_TOKEN_URL || "https://idbroker.webex.com/idb/oauth2/v1/access_token";
 const DEFAULT_DAYS_BACK = Number(process.env.DEFAULT_DAYS_BACK || 7);
 
-// --- Helper: get access token ---
+function pick(err, route) {
+  const status = err?.response?.status || 500;
+  const data = err?.response?.data;
+  const msg =
+    typeof data === "string"
+      ? data
+      : data?.message || data?.error_description || data?.error || err?.message || "Unknown server error";
+  console.error("API error", {
+    route,
+    status,
+    message: msg,
+    url: err?.config?.url,
+    method: err?.config?.method,
+    payload: err?.config?.data
+  });
+  return { status, msg, data };
+}
+
 async function getAccessToken(req) {
   const fwd = req.headers["authorization"];
   if (fwd && /^Bearer\s+/i.test(fwd)) {
     return fwd.replace(/Bearer\s+/i, "").trim();
   }
-  const { WXCC_CLIENT_ID, WXCC_CLIENT_SECRET, WXCC_TOKEN_URL, WXCC_SCOPE } = process.env;
-  if (!WXCC_CLIENT_ID || !WXCC_CLIENT_SECRET || !WXCC_TOKEN_URL) {
-    throw new Error("No Authorization header and service credentials not configured.");
+  const { WXCC_CLIENT_ID, WXCC_CLIENT_SECRET, WXCC_SCOPE } = process.env;
+  if (!WXCC_CLIENT_ID || !WXCC_CLIENT_SECRET || !TOKEN_URL) {
+    throw new Error("Service credentials missing. Set WXCC_CLIENT_ID, WXCC_CLIENT_SECRET, WXCC_TOKEN_URL.");
   }
   const params = new URLSearchParams();
   params.append("grant_type", "client_credentials");
-  if (WXCC_SCOPE) params.append("scope", WXCC_SCOPE);
-
-  const tokenResp = await axios.post(WXCC_TOKEN_URL, params, {
-    auth: { username: WXCC_CLIENT_ID, password: WXCC_CLIENT_SECRET },
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }
-  });
-  return tokenResp.data.access_token;
+  if (WXCC_SCOPE && WXCC_SCOPE.trim()) params.append("scope", WXCC_SCOPE.trim());
+  try {
+    const r = await axios.post(TOKEN_URL, params, {
+      auth: { username: WXCC_CLIENT_ID, password: WXCC_CLIENT_SECRET },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }
+    });
+    return r.data.access_token;
+  } catch (e) {
+    const { msg } = pick(e, "oauth/token");
+    throw new Error("Token request failed. " + msg);
+  }
 }
 
-// --- Helper: date range ---
 function dateRange(daysBack = DEFAULT_DAYS_BACK) {
   const end = new Date();
   const start = new Date(end.getTime() - daysBack * 24 * 60 * 60 * 1000);
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-// --- Widget UI with postMessage bridge for agentEmail ---
 app.get("/widget", (req, res) => {
   res.type("html").send(`
 <!doctype html>
@@ -74,7 +94,7 @@ app.get("/widget", (req, res) => {
       <label>Agent Email <input id="agentEmail" placeholder="agent@example.com"/></label>
       <label>Hours Back <input id="hoursBack" type="number" min="1" max="72" value="24" style="width:80px"/></label>
       <button class="btn" id="reload">Reload</button>
-      <span class="muted">If embedded, parent can send agent email via postMessage</span>
+      <span class="muted">Parent can send agent email via postMessage</span>
     </div>
 
     <table id="grid">
@@ -94,13 +114,11 @@ app.get("/widget", (req, res) => {
     <script>
       const $ = (s) => document.querySelector(s);
 
-      // Prefer query param if present, else wait for parent postMessage
       const params = new URLSearchParams(location.search);
       if (params.get("agentEmail")) {
         $("#agentEmail").value = params.get("agentEmail");
       }
 
-      // Ask parent for context, parent should reply with { type: "WXCC_CONTEXT", agentEmail: "..." }
       function requestParentContext() {
         try {
           if (window.parent && window.parent !== window) {
@@ -116,7 +134,6 @@ app.get("/widget", (req, res) => {
         }
       });
 
-      // Better error surfacing
       async function getJsonOrThrow(resp) {
         const ct = resp.headers.get("content-type") || "";
         let body = null;
@@ -127,9 +144,7 @@ app.get("/widget", (req, res) => {
           try { body = JSON.parse(txt); } catch { body = { error: txt || "no body" }; }
         }
         if (!resp.ok) {
-          const msg = typeof body?.error === "string" ? body.error
-                    : body?.message || body?.error_description
-                    || JSON.stringify(body || {}) || "Request failed";
+          const msg = body?.error || body?.message || body?.error_description || JSON.stringify(body || {});
           throw new Error(resp.status + " " + resp.statusText + ". " + msg);
         }
         return body;
@@ -186,10 +201,7 @@ app.get("/widget", (req, res) => {
       }
 
       document.getElementById("reload").addEventListener("click", load);
-
-      // Kick off a parent context request shortly after load
       setTimeout(requestParentContext, 50);
-      // If query param already set, auto load
       if ($("#agentEmail").value) load();
     </script>
   </body>
@@ -197,22 +209,18 @@ app.get("/widget", (req, res) => {
   `);
 });
 
-// --- API: captures for last N hours, default 24 ---
 app.get("/api/captures/recent", async (req, res) => {
   try {
     const token = await getAccessToken(req);
     const agentEmail = (req.query.agentEmail || "").toString().trim();
     const hours = Math.max(1, Number(req.query.hours || 24));
     const limit = Math.min(1000, Number(req.query.limit || 200));
-
     if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
 
     const now = new Date();
     const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
     const headers = { Authorization: "Bearer " + token };
 
-    // 1) Fetch recent interactions for this agent
-    const interactionsUrl = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
     const interactionsPayload = {
       filters: [
         { field: "agentEmail", operator: "EQUALS", value: agentEmail },
@@ -225,8 +233,9 @@ app.get("/api/captures/recent", async (req, res) => {
     };
 
     async function fetchInteractions() {
+      const primary = `${WXCC_API_BASE}/v1/data/historical/interactions/search`;
       try {
-        const r = await axios.post(interactionsUrl, interactionsPayload, { headers });
+        const r = await axios.post(primary, interactionsPayload, { headers });
         return r.data?.items || r.data?.data || [];
       } catch (e) {
         if (e.response?.status === 404) {
@@ -242,16 +251,14 @@ app.get("/api/captures/recent", async (req, res) => {
     if (!interactions.length) return res.json({ items: [] });
 
     const ixById = new Map(interactions.map((it) => [String(it.interactionId), it]));
-
-    // 2) Query captures by interactionIds in batches
     const interactionIds = [...ixById.keys()];
-    const batchSize = 100;
+
+    const MAX_IDS_PER_CAPTURE_QUERY = 10;
     const allCaptures = [];
 
-    for (let i = 0; i < interactionIds.length; i += batchSize) {
-      const batch = interactionIds.slice(i, i + batchSize);
+    async function postCapturesQuery(ids) {
       const url = `${WXCC_API_BASE}/v1/captures/query`;
-      const payload = { query: { interactionIds: batch } };
+      const payload = { query: { interactionIds: ids } };
       const r = await axios.post(url, payload, {
         headers: {
           ...headers,
@@ -259,46 +266,133 @@ app.get("/api/captures/recent", async (req, res) => {
           "Content-Type": "application/json"
         }
       });
-      const items = Array.isArray(r.data?.items) ? r.data.items : [];
-      allCaptures.push(...items);
+      return Array.isArray(r.data?.items) ? r.data.items : [];
+    }
+
+    async function postCapturesSearch(ids) {
+      const url = `${WXCC_API_BASE}/v1/data/historical/captures/search`;
+      const filters = ids.map((id) => ({ field: "interactionId", operator: "EQUALS", value: id }));
+      const payload = {
+        filters,
+        limit: ids.length,
+        sort: [{ field: "createdAt", order: "DESC" }],
+        fields: ["id", "captureId", "interactionId", "taskId", "createdAt", "url", "playbackUrl", "downloadUrl", "mediaFiles", "links"]
+      };
+      const r = await axios.post(url, payload, { headers });
+      return Array.isArray(r.data?.items) ? r.data.items : [];
+    }
+
+    for (let i = 0; i < interactionIds.length; i += MAX_IDS_PER_CAPTURE_QUERY) {
+      const batch = interactionIds.slice(i, i + MAX_IDS_PER_CAPTURE_QUERY);
+      try {
+        const items = await postCapturesQuery(batch);
+        allCaptures.push(...items);
+      } catch (e) {
+        if (e.response?.status === 404) {
+          const items2 = await postCapturesSearch(batch);
+          allCaptures.push(...items2);
+        } else {
+          throw e;
+        }
+      }
       if (allCaptures.length >= limit) break;
     }
 
-    // 3) Normalize
     const pickUrl = (rec) =>
-      rec?.url || rec?.playbackUrl || rec?.downloadUrl ||
-      (rec.mediaFiles?.[0]?.url) || rec?.links?.playback || rec?.links?.download || null;
+      rec?.url ||
+      rec?.playbackUrl ||
+      rec?.downloadUrl ||
+      (rec.mediaFiles?.[0]?.url) ||
+      rec?.links?.playback ||
+      rec?.links?.download ||
+      null;
 
-    const normalized = allCaptures.map((c) => {
-      const ix = ixById.get(String(c.interactionId)) || {};
-      const durationSec =
-        ix.startTime && ix.endTime
-          ? Math.max(0, Math.round((new Date(ix.endTime) - new Date(ix.startTime)) / 1000))
-          : null;
-      return {
-        captureId: c.captureId || c.id || null,
-        interactionId: c.interactionId || null,
-        taskId: c.taskId || ix.taskId || null,
-        createdAt: c.createdAt || ix.startTime || null,
-        url: pickUrl(c),
-        ani: ix.ani || null,
-        queueName: ix.queueName || null,
-        disposition: ix.disposition || null,
-        durationSec
-      };
-    }).filter((x) => !!x.url);
+    const normalized = allCaptures
+      .map((c) => {
+        const ix = ixById.get(String(c.interactionId)) || {};
+        const durationSec =
+          ix.startTime && ix.endTime
+            ? Math.max(0, Math.round((new Date(ix.endTime) - new Date(ix.startTime)) / 1000))
+            : null;
+        return {
+          captureId: c.captureId || c.id || null,
+          interactionId: c.interactionId || null,
+          taskId: c.taskId || ix.taskId || null,
+          createdAt: c.createdAt || ix.startTime || null,
+          url: pickUrl(c),
+          ani: ix.ani || null,
+          queueName: ix.queueName || null,
+          disposition: ix.disposition || null,
+          durationSec
+        };
+      })
+      .filter((x) => !!x.url);
 
     normalized.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     const items = normalized.slice(0, limit);
 
     res.json({ items, window: { start: start.toISOString(), end: now.toISOString() } });
   } catch (e) {
-    const status = e.response?.status || 500;
-    const data = e.response?.data;
-    const msg =
-      typeof data === "string"
-        ? data
-        : data?.message || data?.error_description || data?.error || e.message || "Unknown server error";
+    const { status, msg, data } = pick(e, "/api/captures/recent");
+    res.status(status).json({ error: msg, details: typeof data === "object" ? data : undefined });
+  }
+});
+
+app.get("/api/interactions", async (req, res) => {
+  try {
+    const token = await getAccessToken(req);
+    const agentEmail = (req.query.agentEmail || "").toString().trim();
+    const daysBack = Number(req.query.daysBack || DEFAULT_DAYS_BACK);
+    if (!agentEmail) return res.status(400).json({ error: "agentEmail is required" });
+
+    const { start, end } = dateRange(daysBack);
+    const payloadBase = {
+      limit: 50,
+      sort: [{ field: "startTime", order: "DESC" }],
+      fields: ["interactionId", "startTime", "endTime", "ani", "dnis", "queueName", "disposition"]
+    };
+    const filters = [
+      { field: "agentEmail", operator: "EQUALS", value: agentEmail },
+      { field: "interactionType", operator: "EQUALS", value: "VOICE" },
+      { field: "startTime", operator: "BETWEEN", value: [start, end] }
+    ];
+    const headers = { Authorization: "Bearer " + token };
+
+    async function postSearch(url, body) {
+      const r = await axios.post(url, body, { headers });
+      return r.data?.items || r.data?.data || [];
+    }
+
+    let items;
+    try {
+      items = await postSearch(`${WXCC_API_BASE}/v1/data/historical/interactions/search`, {
+        ...payloadBase,
+        filters
+      });
+    } catch (e) {
+      const status = e?.response?.status;
+      if (status === 404) {
+        items = await postSearch(`${WXCC_API_BASE}/v1/analytics/interactions/search`, {
+          ...payloadBase,
+          filters
+        });
+      } else if (status === 400) {
+        items = await postSearch(`${WXCC_API_BASE}/v1/data/historical/interactions/search`, {
+          ...payloadBase,
+          filters: [
+            { field: "interactionType", operator: "EQUALS", value: "VOICE" },
+            { field: "startTime", operator: "BETWEEN", value: [start, end] }
+          ]
+        });
+        items = items.filter((x) => (x.agentEmail || "").toLowerCase() === agentEmail.toLowerCase());
+      } else {
+        throw e;
+      }
+    }
+
+    res.json({ items });
+  } catch (e) {
+    const { status, msg, data } = pick(e, "/api/interactions");
     res.status(status).json({ error: msg, details: typeof data === "object" ? data : undefined });
   }
 });
@@ -306,5 +400,5 @@ app.get("/api/captures/recent", async (req, res) => {
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
-  console.log(`My Interactions server listening on port ${PORT}`);
+  console.log("My Interactions server listening on port " + PORT);
 });
