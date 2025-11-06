@@ -1,221 +1,175 @@
 import express from "express";
-import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
-import path from "path";
-import { fileURLToPath } from "url";
+import cors from "cors";
 
 dotenv.config();
-
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: true, credentials: false }));
+app.use(cors());
 
-const PORT = process.env.PORT || 8080;
-const WXCC_API_BASE = process.env.WXCC_API_BASE || "https://api.wxcc-us1.cisco.com";
-const TOKEN_URL = process.env.WXCC_TOKEN_URL || "https://idbroker.webex.com/idb/oauth2/v1/access_token";
-const DEFAULT_DAYS_BACK = Number(process.env.DEFAULT_DAYS_BACK || 7);
+const {
+  DEFAULT_DAYS_BACK,
+  WXCC_API_BASE,
+  WXCC_CLIENT_ID,
+  WXCC_CLIENT_SECRET,
+  WXCC_SCOPE,
+  WXCC_TOKEN_URL,
+} = process.env;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const defaultDaysBack = parseInt(DEFAULT_DAYS_BACK || "7", 10);
+let tokenCache = { access_token: null, expires_at: 0 };
 
-/* ---------- helpers ---------- */
-function normalizeError(e, route, req) {
-  const status = e?.response?.status || 500;
-  const data = e?.response?.data;
-  const url = e?.config?.url;
-  const method = e?.config?.method;
-  const msg =
-    (typeof data === "string" && data) ||
-    data?.message ||
-    data?.error_description ||
-    data?.error ||
-    e?.message ||
-    "Unknown server error";
-  console.error("UPSTREAM ERROR", { route: req?.originalUrl || route, status, method, url, msg, data });
-  return {
-    status,
-    body: {
-      error: msg || "(empty message from upstream)",
-      upstream: { status, method, url, body: data ?? "(no body)" }
-    }
-  };
-}
-
-async function getAccessToken(req) {
-  const fwd = req.headers["authorization"];
-  if (fwd && /^Bearer\s+/i.test(fwd)) {
-    return fwd.replace(/Bearer\s+/i, "").trim();
+// ------------------------------------------------------
+// Helper: Get access token (Service App / client_credentials)
+// ------------------------------------------------------
+async function getAccessToken() {
+  const now = Math.floor(Date.now() / 1000);
+  if (tokenCache.access_token && tokenCache.expires_at > now + 60) {
+    return tokenCache.access_token;
   }
-  const { WXCC_CLIENT_ID, WXCC_CLIENT_SECRET, WXCC_SCOPE } = process.env;
-  if (!WXCC_CLIENT_ID || !WXCC_CLIENT_SECRET || !TOKEN_URL) {
-    throw new Error("Service credentials missing. Set WXCC_CLIENT_ID, WXCC_CLIENT_SECRET, WXCC_TOKEN_URL.");
-  }
+
   const params = new URLSearchParams();
   params.append("grant_type", "client_credentials");
-  if (WXCC_SCOPE && WXCC_SCOPE.trim()) params.append("scope", WXCC_SCOPE.trim());
-  const r = await axios.post(TOKEN_URL, params, {
+  params.append("scope", WXCC_SCOPE);
+
+  const resp = await axios.post(WXCC_TOKEN_URL, params, {
     auth: { username: WXCC_CLIENT_ID, password: WXCC_CLIENT_SECRET },
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
   });
-  return r.data.access_token;
+
+  tokenCache.access_token = resp.data.access_token;
+  tokenCache.expires_at = now + (resp.data.expires_in || 3600);
+  return tokenCache.access_token;
 }
 
-function dateRange(daysBack = DEFAULT_DAYS_BACK) {
-  const end = new Date();
-  const start = new Date(end.getTime() - daysBack * 24 * 60 * 60 * 1000);
-  return { start: start.toISOString(), end: end.toISOString() };
-}
+// ------------------------------------------------------
+// Helpers: Pick agent emails and audio URLs
+// ------------------------------------------------------
+const pickAgentEmails = (capture) => {
+  const emails = new Set();
+  if (typeof capture.agentEmail === "string") emails.add(capture.agentEmail.toLowerCase());
+  if (capture.agent && typeof capture.agent.email === "string") emails.add(capture.agent.email.toLowerCase());
+  if (Array.isArray(capture.participants)) {
+    capture.participants.forEach((p) => {
+      if (typeof p?.email === "string") emails.add(p.email.toLowerCase());
+      if (typeof p?.agentEmail === "string") emails.add(p.agentEmail.toLowerCase());
+    });
+  }
+  return Array.from(emails);
+};
 
-/* ---------- static + widget ---------- */
-app.use("/public", express.static(path.join(__dirname, "public")));
-app.get("/widget", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "widget.html"));
+const pickUrl = (capture) => {
+  const links = [];
+  if (capture.downloadUrl) links.push(capture.downloadUrl);
+  if (Array.isArray(capture.files)) {
+    capture.files.forEach((f) => {
+      if (typeof f.url === "string") links.push(f.url);
+    });
+  }
+  return links[0] || null;
+};
+
+// ------------------------------------------------------
+// Route: /api/captures/recent
+// ------------------------------------------------------
+app.get("/api/captures/recent", async (req, res) => {
+  try {
+    const { agentEmail, hours } = req.query;
+    const since = new Date();
+    since.setHours(since.getHours() - (hours ? parseInt(hours, 10) : defaultDaysBack * 24));
+
+    const token = await getAccessToken();
+    const url = `${WXCC_API_BASE}/v1/captures/query`;
+
+    const r = await axios.post(
+      url,
+      { query: {} },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    if (!r.data || !Array.isArray(r.data.items)) {
+      return res.status(502).json({ error: "invalid_response", upstream: r.data });
+    }
+
+    const recent = r.data.items.filter((c) => {
+      const start = new Date(c.startTime || c.createdTime || 0);
+      return start >= since;
+    });
+
+    const normalized = recent
+      .filter((c) => !agentEmail || pickAgentEmails(c).includes(agentEmail.toLowerCase()))
+      .map((c) => ({
+        id: c.id,
+        startTime: c.startTime,
+        endTime: c.endTime,
+        duration: c.duration,
+        agentEmails: pickAgentEmails(c),
+        downloadUrl: pickUrl(c),
+      }));
+
+    res.json({ items: normalized, count: normalized.length });
+  } catch (err) {
+    const up = err.response || {};
+    res.status(up.status || 500).json({
+      error: "capture_fetch_failed",
+      status: up.status,
+      upstream: {
+        status: up.status,
+        url: up.config?.url,
+        data: up.data,
+      },
+    });
+  }
 });
 
-/* ---------- diagnostics ---------- */
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
+// ------------------------------------------------------
+// Route: /api/capture/:id/stream
+// Streams audio via backend to avoid CORS/auth issues
+// ------------------------------------------------------
+app.get("/api/capture/:id/stream", async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const url = `${WXCC_API_BASE}/v1/captures/${encodeURIComponent(req.params.id)}/download`;
+    const r = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      responseType: "stream",
+    });
+    res.setHeader("Content-Type", r.headers["content-type"] || "audio/mpeg");
+    r.data.pipe(res);
+  } catch (e) {
+    res.status(e.response?.status || 500).json({
+      error: "stream_failed",
+      detail: e.response?.data || e.message,
+    });
+  }
+});
+
+// ------------------------------------------------------
+// Diagnostics
+// ------------------------------------------------------
 app.get("/diag/config", (req, res) => {
   res.json({
     WXCC_API_BASE,
-    TOKEN_URL: TOKEN_URL ? "set" : "unset",
-    WXCC_SCOPE: process.env.WXCC_SCOPE || "(unset)"
+    WXCC_SCOPE,
+    WXCC_TOKEN_URL: !!WXCC_TOKEN_URL,
+    WXCC_CLIENT_ID: WXCC_CLIENT_ID ? "set" : "missing",
+    WXCC_CLIENT_SECRET: WXCC_CLIENT_SECRET ? "set" : "missing",
   });
 });
+
 app.get("/diag/routes", (req, res) => {
-  const routes = [];
-  app._router.stack.forEach((m) => {
-    if (m.route && m.route.path) {
-      const methods = Object.keys(m.route.methods).join(",").toUpperCase();
-      routes.push({ methods, path: m.route.path });
-    } else if (m.name === "router" && m.handle?.stack) {
-      m.handle.stack.forEach((h) => {
-        if (h.route) {
-          const methods = Object.keys(h.route.methods).join(",").toUpperCase();
-          routes.push({ methods, path: h.route.path });
-        }
-      });
-    }
-  });
-  res.json({ routes });
-});
-
-/* ---------- interactions endpoint disabled here on purpose ---------- */
-app.get("/api/interactions", (_req, res) => {
-  res.status(501).json({
-    error: "Historical interactions API is not enabled on this tenant. Use /api/captures/recent instead."
+  res.json({
+    routes: app._router.stack
+      .filter((r) => r.route)
+      .map((r) => Object.keys(r.route.methods)[0].toUpperCase() + " " + r.route.path),
   });
 });
 
-/* ---------- captures via v1/captures/query ---------- */
-/*
-   We mirror your working curl:
-   POST https://api.<region>.cisco.com/v1/captures/query
-   Body: { "query": { "taskIds": [] } }
-
-   Then we filter by createdAt within the requested hours window.
-   If the capture payload exposes an agent email, we filter by that as well.
-*/
-app.get("/api/captures/recent", async (req, res) => {
-  try {
-    const token = await getAccessToken(req);
-    const agentEmail = (req.query.agentEmail || "").toString().trim().toLowerCase();
-    const hours = Math.max(1, Number(req.query.hours || 24));
-    const now = new Date();
-    const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
-
-    const headers = {
-      Authorization: "Bearer " + token,
-      Accept: "application/json",
-      "Content-Type": "application/json"
-    };
-
-    const url = `${WXCC_API_BASE}/v1/captures/query`;
-
-    // Minimal query body that matches your working curl.
-    const body = { query: { taskIds: [] } };
-
-    const r = await axios.post(url, body, { headers });
-
-    // Normalize array of captures from various response shapes.
-    const captures = Array.isArray(r.data?.items)
-      ? r.data.items
-      : Array.isArray(r.data)
-      ? r.data
-      : [];
-
-    // Some orgs return different shapes. We will pick likely fields.
-    const pickCreated = (c) => c.createdAt || c.startTime || c.timestamp || c.recordedAt || null;
-    const pickUrl =
-      (c) =>
-        c.url ||
-        c.playbackUrl ||
-        c.downloadUrl ||
-        (c.mediaFiles && c.mediaFiles[0] && c.mediaFiles[0].url) ||
-        (c.links && (c.links.playback || c.links.download)) ||
-        null;
-
-    // Try to identify agent email in common places.
-    const pickAgentEmails = (c) => {
-      const emails = new Set();
-      if (typeof c.agentEmail === "string") emails.add(c.agentEmail.toLowerCase());
-      if (c.agent && typeof c.agent.email === "string") emails.add(c.agent.email.toLowerCase());
-      if (Array.isArray(c.participants)) {
-        c.participants.forEach((p) => {
-          if (typeof p?.email === "string") emails.add(p.email.toLowerCase());
-          if (typeof p?.agentEmail === "string") emails.add(p.agentEmail.toLowerCase());
-        });
-      }
-      return [...emails];
-    };
-
-    const withinWindow = (c) => {
-      const ts = pickCreated(c);
-      if (!ts) return false;
-      const t = new Date(ts);
-      return t >= from && t <= now;
-    };
-
-    const agentMatches = (c) => {
-      if (!agentEmail) return true;
-      const emails = pickAgentEmails(c);
-      if (!emails.length) return true; // do not drop if agent is not present in payload
-      return emails.includes(agentEmail);
-    };
-
-    const normalized = captures
-      .filter(withinWindow)
-      .filter(agentMatches)
-      .map((c) => {
-        return {
-          captureId: c.captureId || c.id || null,
-          interactionId: c.interactionId || c.taskId || null,
-          taskId: c.taskId || null,
-          createdAt: pickCreated(c),
-          url: pickUrl(c),
-          // pass through a few helpful fields if present
-          ani: c.ani || c.callerId || null,
-          dnis: c.dnis || null,
-          queueName: c.queueName || null,
-          disposition: c.disposition || null
-        };
-      })
-      .filter((x) => !!x.url);
-
-    // Sort newest first.
-    normalized.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-    res.json({
-      items: normalized,
-      window: { start: from.toISOString(), end: now.toISOString() },
-      note: "Results filtered client side because /v1/search is not enabled on this tenant."
-    });
-  } catch (e) {
-    const { status, body } = normalizeError(e, "/api/captures/recent", req);
-    res.status(status).json(body);
-  }
-});
-
-app.listen(PORT, () => {
-  console.log("My Interactions server listening on port " + PORT);
+// ------------------------------------------------------
+// Start server
+// ------------------------------------------------------
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`✅ Server listening on port ${port}`);
 });
