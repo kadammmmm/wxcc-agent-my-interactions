@@ -1,13 +1,17 @@
-import express from "express";
-import axios from "axios";
-import dotenv from "dotenv";
-import cors from "cors";
+// server.js
+const express = require("express");
+const axios = require("axios");
+const dotenv = require("dotenv");
+const cors = require("cors");
+const path = require("path");
 
 dotenv.config();
+
 const app = express();
 app.use(express.json());
 app.use(cors());
 
+// ---------- config ----------
 const {
   DEFAULT_DAYS_BACK,
   WXCC_API_BASE,
@@ -18,17 +22,25 @@ const {
 } = process.env;
 
 const defaultDaysBack = parseInt(DEFAULT_DAYS_BACK || "7", 10);
+
+// ---------- health check ----------
+app.get("/healthz", (req, res) => {
+  res.status(200).send("ok");
+});
+
+// Optional home probe
+app.get("/", (req, res) => {
+  res.status(200).send("wxcc-agent-my-interactions is up");
+});
+
+// ---------- token cache ----------
 let tokenCache = { access_token: null, expires_at: 0 };
 
-// ------------------------------------------------------
-// Helper: Get access token (Service App / client_credentials)
-// ------------------------------------------------------
 async function getAccessToken() {
   const now = Math.floor(Date.now() / 1000);
   if (tokenCache.access_token && tokenCache.expires_at > now + 60) {
     return tokenCache.access_token;
   }
-
   const params = new URLSearchParams();
   params.append("grant_type", "client_credentials");
   params.append("scope", WXCC_SCOPE);
@@ -36,6 +48,7 @@ async function getAccessToken() {
   const resp = await axios.post(WXCC_TOKEN_URL, params, {
     auth: { username: WXCC_CLIENT_ID, password: WXCC_CLIENT_SECRET },
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 10000,
   });
 
   tokenCache.access_token = resp.data.access_token;
@@ -43,10 +56,8 @@ async function getAccessToken() {
   return tokenCache.access_token;
 }
 
-// ------------------------------------------------------
-// Helpers: Pick agent emails and audio URLs
-// ------------------------------------------------------
-const pickAgentEmails = (capture) => {
+// ---------- helpers ----------
+function pickAgentEmails(capture) {
   const emails = new Set();
   if (typeof capture.agentEmail === "string") emails.add(capture.agentEmail.toLowerCase());
   if (capture.agent && typeof capture.agent.email === "string") emails.add(capture.agent.email.toLowerCase());
@@ -57,9 +68,9 @@ const pickAgentEmails = (capture) => {
     });
   }
   return Array.from(emails);
-};
+}
 
-const pickUrl = (capture) => {
+function pickUrl(capture) {
   const links = [];
   if (capture.downloadUrl) links.push(capture.downloadUrl);
   if (Array.isArray(capture.files)) {
@@ -68,16 +79,14 @@ const pickUrl = (capture) => {
     });
   }
   return links[0] || null;
-};
+}
 
-// ------------------------------------------------------
-// Route: /api/captures/recent
-// ------------------------------------------------------
+// ---------- API: recent captures ----------
 app.get("/api/captures/recent", async (req, res) => {
   try {
     const { agentEmail, hours } = req.query;
-    const since = new Date();
-    since.setHours(since.getHours() - (hours ? parseInt(hours, 10) : defaultDaysBack * 24));
+    const windowHours = hours ? parseInt(hours, 10) : defaultDaysBack * 24;
+    const since = new Date(Date.now() - windowHours * 60 * 60 * 1000);
 
     const token = await getAccessToken();
     const url = `${WXCC_API_BASE}/v1/captures/query`;
@@ -85,7 +94,7 @@ app.get("/api/captures/recent", async (req, res) => {
     const r = await axios.post(
       url,
       { query: {} },
-      { headers: { Authorization: `Bearer ${token}` } }
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }
     );
 
     if (!r.data || !Array.isArray(r.data.items)) {
@@ -119,14 +128,12 @@ app.get("/api/captures/recent", async (req, res) => {
         url: up.config?.url,
         data: up.data,
       },
+      message: err.message,
     });
   }
 });
 
-// ------------------------------------------------------
-// Route: /api/capture/:id/stream
-// Streams audio via backend to avoid CORS/auth issues
-// ------------------------------------------------------
+// ---------- API: stream a recording via backend ----------
 app.get("/api/capture/:id/stream", async (req, res) => {
   try {
     const token = await getAccessToken();
@@ -134,6 +141,7 @@ app.get("/api/capture/:id/stream", async (req, res) => {
     const r = await axios.get(url, {
       headers: { Authorization: `Bearer ${token}` },
       responseType: "stream",
+      timeout: 30000,
     });
     res.setHeader("Content-Type", r.headers["content-type"] || "audio/mpeg");
     r.data.pipe(res);
@@ -145,9 +153,7 @@ app.get("/api/capture/:id/stream", async (req, res) => {
   }
 });
 
-// ------------------------------------------------------
-// Diagnostics
-// ------------------------------------------------------
+// ---------- diagnostics ----------
 app.get("/diag/config", (req, res) => {
   res.json({
     WXCC_API_BASE,
@@ -159,17 +165,24 @@ app.get("/diag/config", (req, res) => {
 });
 
 app.get("/diag/routes", (req, res) => {
-  res.json({
-    routes: app._router.stack
-      .filter((r) => r.route)
-      .map((r) => Object.keys(r.route.methods)[0].toUpperCase() + " " + r.route.path),
+  const routes = [];
+  app._router.stack.forEach((r) => {
+    if (r.route && r.route.path) {
+      const method = Object.keys(r.route.methods)[0]?.toUpperCase() || "GET";
+      routes.push(`${method} ${r.route.path}`);
+    }
   });
+  res.json({ routes });
 });
 
-// ------------------------------------------------------
-// Start server
-// ------------------------------------------------------
+// ---------- optional: serve widget.html if present ----------
+app.get("/widget", (req, res) => {
+  const p = path.join(__dirname, "widget.html");
+  res.sendFile(p);
+});
+
+// ---------- start ----------
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`✅ Server listening on port ${port}`);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Server listening on ${port}`);
 });
