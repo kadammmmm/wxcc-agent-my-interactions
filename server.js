@@ -179,6 +179,19 @@ app.get("/diag/routes", (req, res) => {
   res.json({ routes });
 });
 
+// add near other diagnostics
+import fs from "fs";
+app.get("/diag/fs", (req, res) => {
+  try {
+    const cwd = process.cwd();
+    const files = fs.readdirSync(cwd);
+    res.json({ cwd, files });
+  } catch (e) {
+    res.status(500).json({ error: "fs_list_failed", detail: e.message });
+  }
+});
+
+
 // ---------- optional: serve widget.html if present ----------
 app.get("/widget", (req, res) => {
   res.sendFile(path.join(__dirname, "widget.html"));
