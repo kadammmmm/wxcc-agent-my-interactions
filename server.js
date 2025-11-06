@@ -1,11 +1,15 @@
-// server.js
-const express = require("express");
-const axios = require("axios");
-const dotenv = require("dotenv");
-const cors = require("cors");
-const path = require("path");
+// server.js  (ESM)
+import express from "express";
+import axios from "axios";
+import dotenv from "dotenv";
+import cors from "cors";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
@@ -28,7 +32,7 @@ app.get("/healthz", (req, res) => {
   res.status(200).send("ok");
 });
 
-// Optional home probe
+// Optional root
 app.get("/", (req, res) => {
   res.status(200).send("wxcc-agent-my-interactions is up");
 });
@@ -177,8 +181,7 @@ app.get("/diag/routes", (req, res) => {
 
 // ---------- optional: serve widget.html if present ----------
 app.get("/widget", (req, res) => {
-  const p = path.join(__dirname, "widget.html");
-  res.sendFile(p);
+  res.sendFile(path.join(__dirname, "widget.html"));
 });
 
 // ---------- start ----------
