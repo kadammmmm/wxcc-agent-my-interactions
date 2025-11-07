@@ -1,4 +1,21 @@
-// server.js  ESM. Hybrid auth: Service App for Captures. OAuth Integration for Search.
+// server.js  ESM. Tasks-only list via Search API using an OAuth Integration token.
+// No Captures. No recordings.
+//
+// ENV REQUIRED
+// WXCC_API_BASE=https://api.wxcc-us1.cisco.com
+// ORG_ID=<your WxCC org id>
+// WXCC_DESKTOP_ORIGIN=https://desktop.wxcc-us1.cisco-bx.com   // optional but recommended
+//
+// INTEGRATION_CLIENT_ID=...
+// INTEGRATION_CLIENT_SECRET=...
+// INTEGRATION_REDIRECT_URI=https://<your-host>/oauth/callback
+// INTEGRATION_SCOPES=<exact Search permission string shown in Integration UI, no quotes>
+//
+// OPTIONAL
+// DEFAULT_DAYS_BACK=7
+//
+// package.json
+// { "type": "module", "scripts": { "start": "node server.js" } }
 
 import express from "express";
 import axios from "axios";
@@ -26,17 +43,12 @@ app.use(cors());
 const {
   DEFAULT_DAYS_BACK,
   WXCC_API_BASE,
-  WXCC_CLIENT_ID,
-  WXCC_CLIENT_SECRET,
-  WXCC_SCOPE,                 // Example: cjp:config_read  no quotes
-  WXCC_TOKEN_URL,            // https://idbroker.webex.com/idb/oauth2/v1/access_token
-  ORG_ID,                    // Strongly recommended
-  WXCC_DESKTOP_ORIGIN,       // Optional. Desktop origin for CORS. Example: https://desktop.wxcc-us1.cisco-bx.com
-  // OAuth Integration for Search
+  ORG_ID,
+  WXCC_DESKTOP_ORIGIN,
   INTEGRATION_CLIENT_ID,
   INTEGRATION_CLIENT_SECRET,
-  INTEGRATION_REDIRECT_URI,  // Example: https://wxcc-agent-my-interactions.onrender.com/oauth/callback
-  INTEGRATION_SCOPES,        // Use the exact Search scope string shown in the Integration UI
+  INTEGRATION_REDIRECT_URI,
+  INTEGRATION_SCOPES,
 } = process.env;
 
 const defaultDaysBack = parseInt(DEFAULT_DAYS_BACK || "7", 10);
@@ -90,38 +102,6 @@ app.use("/api", (req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
 });
-
-// ----------------------------------------------------
-// Service App token cache. Client credentials
-// ----------------------------------------------------
-let svcToken = { access: null, exp: 0 };
-
-async function getServiceAccessToken() {
-  const now = Math.floor(Date.now() / 1000);
-  if (svcToken.access && svcToken.exp > now + 60) return svcToken.access;
-
-  const params = new URLSearchParams();
-  params.append("grant_type", "client_credentials");
-  params.append("scope", WXCC_SCOPE);
-
-  const r = await axios.post(WXCC_TOKEN_URL, params, {
-    auth: { username: WXCC_CLIENT_ID, password: WXCC_CLIENT_SECRET },
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 15000,
-  });
-
-  svcToken.access = r.data.access_token;
-  svcToken.exp = now + (r.data.expires_in || 3600);
-  return svcToken.access;
-}
-
-// Resolve org id. Prefer ORG_ID env
-function resolveOrgIdFromToken(accessToken) {
-  if (ORG_ID) return ORG_ID;
-  const parts = String(accessToken || "").split("_");
-  const last = parts[parts.length - 1];
-  return /^[0-9a-f-]{8,}$/i.test(last) ? last : null;
-}
 
 // ----------------------------------------------------
 // OAuth Integration for Search. Authorization Code
@@ -204,17 +184,35 @@ const toInt = (v, d = 0) => {
   return Number.isFinite(n) ? n : d;
 };
 
-function chunkArray(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
+// Normalize task item for UI
+function normalizeTask(t) {
+  // Many tenants include these fields. Leave undefined if absent.
+  const participants = Array.isArray(t.participants) ? t.participants : [];
+  const customer =
+    participants.find((p) => (p?.role || "").toLowerCase() === "customer") || {};
+  const agentEmail =
+    t.agentEmail || t.agent?.email || participants.find((p) => p?.agentEmail)?.agentEmail || null;
+
+  return {
+    id: t.id,
+    startTime: t.startTime || null,
+    endTime: t.endTime || null,
+    duration: t.duration || null,
+    channelType: t.channelType || "telephony",
+    queueName: t.queueName || t.queue?.name || null,
+    ani: t.ani || customer.phoneNumber || null,
+    dnis: t.dnis || t.calledNumber || null,
+    agentEmail: agentEmail || null,
+  };
 }
 
 // ----------------------------------------------------
-// Search API. Use Integration token
+// Search API. Use Integration token. Tasks only.
 // ----------------------------------------------------
-async function searchTaskIds({ userToken, orgId, fromMs, toMs, agentEmail, pageSize = 200, maxPages = 5 }) {
+async function searchTasksPage({ userToken, orgId, fromMs, toMs, after = null, first = 200 }) {
   const url = `${WXCC_API_BASE.replace(/\/$/, "")}/v1/search?orgId=${encodeURIComponent(orgId)}`;
+
+  // Keep query conservative. Different orgs expose different fields in the schema.
   const query = `
     query($from: Long!, $to: Long!, $first: Int!, $after: String) {
       tasks(
@@ -225,88 +223,98 @@ async function searchTaskIds({ userToken, orgId, fromMs, toMs, agentEmail, pageS
         items {
           id
           startTime
+          endTime
+          duration
+          channelType
+          queueName
+          ani
+          dnis
           agentEmail
           agent { email }
-          participants { role email agentEmail }
+          participants { role email agentEmail phoneNumber }
         }
         pageInfo { hasNextPage endCursor }
       }
     }
   `;
 
-  const vars = { from: fromMs, to: toMs, first: toInt(pageSize, 200), after: null };
-  const wantEmail = agentEmail ? String(agentEmail).toLowerCase() : null;
+  const variables = { from: fromMs, to: toMs, first, after };
 
-  const found = [];
-  for (let page = 0; page < maxPages; page++) {
-    const r = await axios.post(url, { query, variables: vars }, {
-      headers: { Authorization: `Bearer ${userToken}` },
-      timeout: 30000,
-    });
+  const r = await axios.post(url, { query, variables }, {
+    headers: { Authorization: `Bearer ${userToken}` },
+    timeout: 30000,
+  });
 
-    if (r.data?.errors?.length) {
-      const err = new Error("search_graphql_error");
-      err.response = { status: 400, data: r.data };
-      throw err;
-    }
-
-    const items = r?.data?.data?.tasks?.items || [];
-    for (const t of items) {
-      if (!t?.id) continue;
-      if (!wantEmail) { found.push(t.id); continue; }
-      const set = new Set();
-      if (t.agentEmail) set.add(String(t.agentEmail).toLowerCase());
-      if (t.agent?.email) set.add(String(t.agent.email).toLowerCase());
-      if (Array.isArray(t.participants)) {
-        t.participants.forEach(p => {
-          if (p?.email) set.add(String(p.email).toLowerCase());
-          if (p?.agentEmail) set.add(String(p.agentEmail).toLowerCase());
-        });
-      }
-      if (set.has(wantEmail)) found.push(t.id);
-    }
-
-    const info = r?.data?.data?.tasks?.pageInfo;
-    if (!info?.hasNextPage || !info?.endCursor) break;
-    vars.after = info.endCursor;
+  if (r.data?.errors?.length) {
+    const err = new Error("search_graphql_error");
+    err.response = { status: 400, data: r.data };
+    throw err;
   }
 
-  return Array.from(new Set(found));
+  const items = r?.data?.data?.tasks?.items || [];
+  const pageInfo = r?.data?.data?.tasks?.pageInfo || {};
+  return { items, pageInfo };
 }
 
-// API. Use Integration token to get taskIds
-// GET /api/tasks/search?hours=168&agentEmail=a@b.com&pageSize=200
+// GET /api/tasks/search?hours=168&agentEmail=a@b.com&pageSize=200&maxPages=5
 app.get("/api/tasks/search", async (req, res) => {
   try {
+    // Ensure Search authorized
     let token = searchToken.access;
-    if (!token) {
-      return res.status(401).json({ error: "search_not_authorized", login: "/oauth/login" });
-    }
     token = await refreshSearchTokenIfNeeded();
     if (!token) {
       return res.status(401).json({ error: "search_not_authorized", login: "/oauth/login" });
     }
 
+    if (!ORG_ID) {
+      return res.status(500).json({ error: "missing_org_id", message: "Set ORG_ID in environment" });
+    }
+
     const hours = toInt(req.query.hours, defaultDaysBack * 24);
     const toMs = Date.now();
     const fromMs = toMs - hours * 60 * 60 * 1000;
-    const agentEmail = req.query.agentEmail || null;
+    const pageSize = toInt(req.query.pageSize, 200);
+    const maxPages = toInt(req.query.maxPages, 5);
+    const filterEmail = (req.query.agentEmail || "").toLowerCase();
 
-    const svcAccess = await getServiceAccessToken();
-    const orgId = resolveOrgIdFromToken(svcAccess);
-    if (!orgId) return res.status(500).json({ error: "missing_org_id" });
+    const all = [];
+    let after = null;
 
-    const taskIds = await searchTaskIds({
-      userToken: token,
-      orgId,
+    for (let i = 0; i < maxPages; i++) {
+      const { items, pageInfo } = await searchTasksPage({
+        userToken: token,
+        orgId: ORG_ID,
+        fromMs,
+        toMs,
+        after,
+        first: pageSize,
+      });
+
+      // Local filter by agent email. Safer than assuming schema fields.
+      const filtered = items.filter((t) => {
+        if (!filterEmail) return true;
+        const emails = new Set();
+        if (t.agentEmail) emails.add(String(t.agentEmail).toLowerCase());
+        if (t.agent?.email) emails.add(String(t.agent.email).toLowerCase());
+        (t.participants || []).forEach((p) => {
+          if (p?.email) emails.add(String(p.email).toLowerCase());
+          if (p?.agentEmail) emails.add(String(p.agentEmail).toLowerCase());
+        });
+        return emails.has(filterEmail);
+      });
+
+      filtered.forEach((t) => all.push(normalizeTask(t)));
+
+      if (!pageInfo?.hasNextPage || !pageInfo?.endCursor) break;
+      after = pageInfo.endCursor;
+    }
+
+    res.json({
+      count: all.length,
       fromMs,
       toMs,
-      agentEmail,
-      pageSize: toInt(req.query.pageSize, 200),
-      maxPages: toInt(req.query.maxPages, 5),
+      items: all,
     });
-
-    res.json({ taskIds, count: taskIds.length, fromMs, toMs });
   } catch (err) {
     const up = err.response || {};
     res.status(up.status || 500).json({
@@ -319,174 +327,17 @@ app.get("/api/tasks/search", async (req, res) => {
 });
 
 // ----------------------------------------------------
-// Captures API. Use Service App token
-// ----------------------------------------------------
-async function listCapturesChunked({ token, orgId, taskIds, urlExpiration = 3600 }) {
-  const all = [];
-  const endpoint = `${WXCC_API_BASE.replace(/\/$/, "")}/v1/captures/query`;
-  for (const batch of chunkArray(taskIds, 10)) {
-    const r = await axios.post(
-      endpoint,
-      { orgId, taskIds: batch.map(String), urlExpiration: Number(urlExpiration) },
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
-    );
-    const items = Array.isArray(r.data?.items) ? r.data.items : [];
-    all.push(...items);
-  }
-  return all;
-}
-
-// One taskId -> capture
-app.get("/api/capture/by-task", async (req, res) => {
-  try {
-    const { taskId, urlExpiration = 3600 } = req.query;
-    if (!taskId) return res.status(400).json({ error: "missing_taskId" });
-
-    const token = await getServiceAccessToken();
-    const orgId = resolveOrgIdFromToken(token);
-    if (!orgId) return res.status(500).json({ error: "missing_org_id" });
-
-    const endpoint = `${WXCC_API_BASE.replace(/\/$/, "")}/v1/captures/query`;
-    const r = await axios.post(
-      endpoint,
-      { orgId, taskIds: [String(taskId)], urlExpiration: Number(urlExpiration) },
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
-    );
-
-    const items = Array.isArray(r.data?.items) ? r.data.items : [];
-    res.json({ items, count: items.length });
-  } catch (err) {
-    const up = err.response || {};
-    res.status(up.status || 500).json({
-      error: "capture_fetch_failed",
-      status: up.status,
-      upstream: { status: up.status, url: up.config?.url, data: up.data },
-      message: err.message,
-    });
-  }
-});
-
-// Many taskIds -> captures
-app.post("/api/captures/by-tasks", async (req, res) => {
-  try {
-    const { taskIds = [], urlExpiration = 3600 } = req.body || {};
-    if (!Array.isArray(taskIds) || taskIds.length === 0) {
-      return res.status(400).json({ error: "missing_taskIds" });
-    }
-
-    const token = await getServiceAccessToken();
-    const orgId = resolveOrgIdFromToken(token);
-    if (!orgId) return res.status(500).json({ error: "missing_org_id" });
-
-    const items = await listCapturesChunked({ token, orgId, taskIds, urlExpiration: Number(urlExpiration) });
-    res.json({ items, count: items.length });
-  } catch (err) {
-    const up = err.response || {};
-    res.status(up.status || 500).json({
-      error: "capture_fetch_failed",
-      status: up.status,
-      upstream: { status: up.status, url: up.config?.url, data: up.data },
-      message: err.message,
-    });
-  }
-});
-
-// Stream capture audio via backend
-app.get("/api/capture/:id/stream", async (req, res) => {
-  try {
-    const token = await getServiceAccessToken();
-    const url = `${WXCC_API_BASE.replace(/\/$/, "")}/v1/captures/${encodeURIComponent(req.params.id)}/download`;
-    const r = await axios.get(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      responseType: "stream",
-      timeout: 60000,
-    });
-    res.setHeader("Content-Type", r.headers["content-type"] || "audio/mpeg");
-    r.data.pipe(res);
-  } catch (e) {
-    res.status(e.response?.status || 500).json({
-      error: "stream_failed",
-      detail: e.response?.data || e.message,
-    });
-  }
-});
-
-// Convenience. Combined route: find tasks and return captures
-// GET /api/captures/recent?hours=168&agentEmail=a@b.com
-app.get("/api/captures/recent", async (req, res) => {
-  try {
-    // Ensure Search authorized
-    let tokenUser = searchToken.access;
-    tokenUser = await refreshSearchTokenIfNeeded();
-    if (!tokenUser) {
-      return res.status(401).json({ error: "search_not_authorized", login: "/oauth/login" });
-    }
-
-    const hours = toInt(req.query.hours, defaultDaysBack * 24);
-    const toMs = Date.now();
-    const fromMs = toMs - hours * 60 * 60 * 1000;
-    const agentEmail = req.query.agentEmail || null;
-
-    const tokenSvc = await getServiceAccessToken();
-    const orgId = resolveOrgIdFromToken(tokenSvc);
-    if (!orgId) return res.status(500).json({ error: "missing_org_id" });
-
-    const taskIds = await searchTaskIds({
-      userToken: tokenUser,
-      orgId,
-      fromMs,
-      toMs,
-      agentEmail,
-      pageSize: 200,
-      maxPages: 5,
-    });
-
-    if (taskIds.length === 0) return res.json({ items: [], count: 0 });
-
-    const captures = await listCapturesChunked({ token: tokenSvc, orgId, taskIds, urlExpiration: 3600 });
-
-    const normalized = captures.map((c) => {
-      const emails = new Set();
-      if (c.agentEmail) emails.add(String(c.agentEmail).toLowerCase());
-      if (c.agent?.email) emails.add(String(c.agent.email).toLowerCase());
-      return {
-        id: c.id,
-        taskId: c.taskId,
-        startTime: c.startTime,
-        endTime: c.endTime,
-        duration: c.duration,
-        agentEmails: Array.from(emails),
-        downloadUrl: c.downloadUrl || (Array.isArray(c.files) ? (c.files.find((f) => f.url)?.url || null) : null),
-      };
-    });
-
-    res.json({ items: normalized, count: normalized.length });
-  } catch (err) {
-    const up = err.response || {};
-    res.status(up.status || 500).json({
-      error: "capture_fetch_failed",
-      status: up.status,
-      upstream: { status: up.status, url: up.config?.url, data: up.data },
-      message: err.message,
-    });
-  }
-});
-
-// ----------------------------------------------------
 // Diagnostics
 // ----------------------------------------------------
 app.get("/diag/config", (req, res) => {
   res.json({
     WXCC_API_BASE,
-    WXCC_SCOPE,
-    WXCC_TOKEN_URL: !!WXCC_TOKEN_URL,
-    WXCC_CLIENT_ID: WXCC_CLIENT_ID ? "set" : "missing",
-    WXCC_CLIENT_SECRET: WXCC_CLIENT_SECRET ? "set" : "missing",
-    DESKTOP_ORIGIN,
     ORG_ID: ORG_ID ? "set" : "not_set",
+    DESKTOP_ORIGIN,
     IntegrationConfigured: Boolean(INTEGRATION_CLIENT_ID && INTEGRATION_CLIENT_SECRET && INTEGRATION_REDIRECT_URI),
     SearchAuthorized: Boolean(searchToken.access),
     SearchTokenExp: searchToken.exp || null,
+    DEFAULT_DAYS_BACK: defaultDaysBack,
   });
 });
 
